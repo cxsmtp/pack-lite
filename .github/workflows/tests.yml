@@ -19,5 +19,11 @@ jobs:
           persist-credentials: false
       - name: Syntax check
         run: node --check PocketLifeOS.js
+      - name: release.json matches PocketLifeOS.js
+        run: |
+          expected="$(node -e "process.stdout.write(require('./release.json').sha256)")"
+          actual="$(sha256sum PocketLifeOS.js | cut -d' ' -f1)"
+          echo "expected $expected"; echo "actual   $actual"
+          test "$expected" = "$actual"
       - name: Simulated Google + Pocket end-to-end tests
         run: node test/test.js

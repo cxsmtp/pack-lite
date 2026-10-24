@@ -1,8 +1,10 @@
 // Simulates Google Apps Script services + Pocket API to exercise PocketLifeOS.gs end to end.
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 const crypto = require('crypto');
-const code = fs.readFileSync(process.argv[2] || require('path').join(__dirname, '..', 'PocketLifeOS.js'), 'utf8');
+const SCRIPT_PATH = path.join(__dirname, '..', 'PocketLifeOS.js');   // fixed: the harness only ever loads this repo's script
+const code = fs.readFileSync(SCRIPT_PATH, 'utf8');
 const log = [];
 let idc = 0; const nid = (p) => p + (++idc);
 
@@ -102,7 +104,7 @@ const recordings = [
     summarizations: { s: { v2: { summary: { markdown: 'Long talk about the roadmap, client invoice and sprint' } } } } }
 ];
 const scriptCalls = [];
-const gh = { head: { sha: 'aaaa111', commit: { message: 'New feature\nbody', verification: { verified: false }, committer: { date: '2026-10-24' } } }, file: '', v: 3, puts: [], versionManifests: {},
+const gh = { head: { sha: 'a'.repeat(40), commit: { message: 'New feature\nbody', verification: { verified: false }, committer: { date: '2026-10-24' } } }, file: '', v: 3, puts: [], versionManifests: {},
   files: [{ name: 'Code', type: 'SERVER_JS', source: 'old' }, { name: 'appsscript', type: 'JSON', source: '{"timeZone":"Asia/Kolkata","runtimeVersion":"V8"}' }],
   deployments: [
     { deploymentId: 'HEADDEP', deploymentConfig: {}, entryPoints: [] },
@@ -169,8 +171,18 @@ const UrlFetchApp = {
       else text = b.system.indexOf('weekly') >= 0 ? '## Highlights\n- Busy week\n## Decisions\n- **Beta** on 4 Nov' : 'You talked with Priya on the standup.';
       return resp(200, { content: [{ type: 'thinking', thinking: '' }, { type: 'text', text }], stop_reason: 'end_turn', usage: { input_tokens: 1000, output_tokens: 200 } });
     }
-    if (u.host === 'api.github.com') { if (/\/commits\/main$/.test(u.pathname)) return resp(200, gh.head); return resp(404, {}); }
-    if (u.host === 'raw.githubusercontent.com') return resp(200, gh.file);
+    if (u.host === 'api.github.com') {
+      if (/\/commits\/main$/.test(u.pathname)) return resp(200, gh.head);
+      const cm = u.pathname.match(/\/contents\/([^/]+)$/);
+      if (cm && u.searchParams.get('ref') === gh.head.sha) {
+        const name = decodeURIComponent(cm[1]);
+        const body = name === 'release.json' ? (gh.release !== undefined ? gh.release : JSON.stringify({ file: 'PocketLifeOS.js', sha256: crypto.createHash('sha256').update(gh.file, 'utf8').digest('hex') }))
+          : name === 'PocketLifeOS.js' ? (gh.served !== undefined ? gh.served : gh.file) : null;
+        if (body === null) return resp(404, {});
+        return resp(200, { encoding: 'base64', content: Buffer.from(body, 'utf8').toString('base64').replace(/(.{60})/g, '$1\n') });
+      }
+      return resp(404, {});
+    }
     if (u.host === 'script.googleapis.com') {
       const path = u.pathname.replace(/^\/v1\/projects\/[^/]+/, '');
       const m = (p.method || 'get').toLowerCase();
@@ -215,7 +227,9 @@ const ctxGlobals = {
   Utilities: {
     getUuid: () => crypto.randomUUID(),
     parseDate: (str, tz, fmt) => { const off = tz === 'Etc/UTC' ? 'Z' : '+05:30'; return new Date(str + off); }, sleep: (ms) => { log.push('sleep ' + ms); },
-    computeDigest: (a, s) => Array.from(crypto.createHash('md5').update(s).digest()).map(b => b > 127 ? b - 256 : b), DigestAlgorithm: { MD5: 'md5' },
+    computeDigest: (a, s) => { if (a !== 'sha256') throw new Error('only SHA-256 is used'); return Array.from(crypto.createHash('sha256').update(s, 'utf8').digest()).map(b => b > 127 ? b - 256 : b); },
+    DigestAlgorithm: { SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' },
+    base64Decode: (b64) => Array.from(Buffer.from(b64, 'base64')), newBlob: (bytes) => ({ getDataAsString: () => Buffer.from(bytes).toString('utf8') }),
     formatDate(d, tz, pat) {
       const f = (o) => new Intl.DateTimeFormat('en-GB', Object.assign({ timeZone: tz }, o)).format(d);
       return pat.replace(/yyyy|MMMM|MM|dd|d|HH|mm|EEEE|EEE/g, t => ({ yyyy: f({ year: 'numeric' }), MMMM: f({ month: 'long' }), MM: f({ month: '2-digit' }), dd: f({ day: '2-digit' }), d: f({ day: 'numeric' }),
@@ -234,4 +248,4 @@ const ctxGlobals = {
 };
 vm.createContext(ctxGlobals);
 vm.runInContext(code + '\n;this.__api = { setup, syncNow, api, doPost, dailyDigest, normalize_, parseRpc_, UI_HTML_ };', ctxGlobals);
-module.exports = { gh, scriptCalls, mkFile, aiCalls, uploads, uploadReqs, G: ctxGlobals, items, docs, sheets, taskStore, mcpCalls, calls, triggers, log, store, recordings };
+module.exports = { SCRIPT_PATH, gh, scriptCalls, mkFile, aiCalls, uploads, uploadReqs, G: ctxGlobals, items, docs, sheets, taskStore, mcpCalls, calls, triggers, log, store, recordings };
