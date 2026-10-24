@@ -283,6 +283,26 @@ gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace('1.0.0', '1.0.2'
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;
+// Cloud project with the Apps Script API off (Google's hidden default project)
+gh.apiOff = 'project';
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/standard Cloud project/.test(threw) && !/console\.developers/.test(threw), 'clear instructions when the Cloud project has the API off: ' + threw);
+gh.apiOff = false;
+// GitHub rate limit for anonymous calls, then a read-only token
+gh.rateLimited = true;
+threw = ''; try { A.api('checkUpdate', {}); } catch (e) { threw = e.message; }
+ok(/read-only GitHub token/.test(threw) && /Try again after \d\d:\d\d/.test(threw), 'rate limit explained: ' + threw);
+threw = ''; try { A.api('saveSettings', { githubToken: 'not a token' }); } catch (e) { threw = e.message; }
+ok(/does not look like a GitHub token/.test(threw) && !H.store.githubToken, 'malformed token refused');
+gh.validToken = 'github_pat_' + 'A1'.repeat(20);
+ok(A.api('saveSettings', { githubToken: gh.validToken }).update.hasToken, 'token saved');
+ok(A.api('checkUpdate', {}).latest && gh.lastAuth === 'Bearer ' + gh.validToken, 'token sent and rate limit avoided');
+ok(!/github_pat_/.test(JSON.stringify(A.api('state'))), 'token never sent back to the dashboard');
+gh.validToken = 'github_pat_' + 'B2'.repeat(20);
+threw = ''; try { A.api('checkUpdate', {}); } catch (e) { threw = e.message; }
+ok(/did not accept the saved GitHub token/.test(threw), 'rejected token explained');
+ok(!A.api('saveSettings', { clearGithubToken: true }).update.hasToken, 'token removed');
+gh.rateLimited = false; delete gh.validToken;
 // token in body + constant-time compare
 const tk2 = JSON.parse(H.store.cfg).webhookToken;
 ok(/conversations today/.test(A.doPost({ parameter: {}, postData: { contents: JSON.stringify({ token: tk2, action: 'status' }) } })), 'token accepted in JSON body');

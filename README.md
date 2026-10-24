@@ -40,6 +40,20 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 
 The script checks this repo's `main` branch every 6 hours and installs new commits on its own. Before installing, it checks four things. The commit must be signed and verified by GitHub (merges made on github.com are). The code is downloaded through GitHub's API at that exact commit. Its SHA-256 must match the commit's `release.json`, which CI checks on every change. And the file must be complete and recognisably Pocket Life OS. It backs up the old code to Drive (`_Life OS system/Code backups`), keeps every web-app URL and its access setting, and e-mails you. **Settings → Updates** has Check now, Install latest, Roll back, "ask me first" mode, and an option to install only signed, verified commits.
 
+### Turn on auto-update (one time, about 10 minutes)
+
+To install updates, the script uses the Apps Script API, which must be switched on in two places. The second is a Google Cloud project, and Google hides the one it creates for each script, so link the script to a project of your own:
+
+1. Open <https://script.google.com/home/usersettings> and turn **Google Apps Script API** on.
+2. Open <https://console.cloud.google.com>, then **Select a project → New project**. Name it `Pocket Life OS` and press **Create**. On its welcome page, copy the **Project number**.
+3. Go to **APIs & Services → Library** and enable **Apps Script API**, **Google Drive API**, **Google Sheets API** and **Google Tasks API**.
+4. Go to **Google Auth Platform** (it may be shown as **OAuth consent screen**) and press **Get started**. Enter app name `Pocket Life OS` and your e-mail for both e-mail fields, choose audience **External**, then **Create**. Next, under **Audience**, press **Publish app**. Without publishing, Google signs the script out every 7 days. The app stays unverified, which is fine for your own use.
+5. In the script editor, open **Project Settings** (gear icon). Under **Google Cloud Platform (GCP) Project**, choose **Change project**, paste the project number and press **Set project**.
+6. Run `setup` once and approve the permissions again. Google warns you that the app isn't verified: choose **Advanced → Go to Pocket Life OS**. Your web-app URLs stay the same.
+7. Optional: in **Settings → Updates → GitHub token**, paste a fine-grained token with **Public repositories (read-only)** access and no permissions. It cannot change anything. Without one, GitHub allows only a few anonymous checks an hour from Google's shared servers, and checks sometimes fail with "HTTP 403".
+
+If you would rather skip this, set **Install updates** to **Never** and update by pasting the new `PocketLifeOS.js` into the editor.
+
 ## Security
 
 - **Where it runs:** the script runs as you, inside your Google account. The dashboard opens only for your Google login.

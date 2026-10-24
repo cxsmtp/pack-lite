@@ -336,6 +336,7 @@ function getCfg_() {
 function saveCfg_(cfg) { props_().setProperty('cfg', JSON.stringify(cfg)); }
 function getKey_() { return props_().getProperty('pocketKey') || ''; }
 function getAiKey_() { return props_().getProperty('anthropicKey') || ''; }
+function getGithubToken_() { return props_().getProperty('githubToken') || ''; }
 function getState_(k, dflt) { const v = props_().getProperty('st_' + k); return v == null ? dflt : JSON.parse(v); }
 function setState_(k, v) { props_().setProperty('st_' + k, JSON.stringify(v)); }
 
@@ -1658,7 +1659,7 @@ function apiState_() {
     links: { dashboard: ScriptApp.getService().getUrl() || '' }, claudeInstructions: CLAUDE_INSTRUCTIONS_(),
     ai: { configured: !!getAiKey_(), usage: getState_('aiUsage', null), models: CLAUDE_MODELS },
     appRatings: getState_('appRatings', {}),
-    update: { repo: UPDATE_REPO, branch: UPDATE_BRANCH, installed: getState_('installedSha', ''), check: getState_('updateCheck', null), last: getState_('lastUpdate', null) }
+    update: { repo: UPDATE_REPO, branch: UPDATE_BRANCH, installed: getState_('installedSha', ''), check: getState_('updateCheck', null), last: getState_('lastUpdate', null), hasToken: !!getGithubToken_() }
   };
   const ctx = openWorkspace_(cfg);
   out.links.root = ctx.root.getUrl();
@@ -1704,6 +1705,12 @@ function apiSaveSettings_(args) {
   if (args.clearKey) props_().deleteProperty('pocketKey');
   if (args.aiKey) props_().setProperty('anthropicKey', String(args.aiKey).trim());
   if (args.clearAiKey) props_().deleteProperty('anthropicKey');
+  if (args.githubToken) {
+    const gt = String(args.githubToken).trim();
+    if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,255}$/.test(gt)) throw new Error('That does not look like a GitHub token (they start with github_pat_ or ghp_).');
+    props_().setProperty('githubToken', gt);
+  }
+  if (args.clearGithubToken) props_().deleteProperty('githubToken');
   if (CLAUDE_MODELS.indexOf(next.aiModel) < 0) next.aiModel = DEFAULT_CFG.aiModel;
   ['aiMaxAgeDays', 'weeklyHour'].forEach(function (k) { next[k] = Number(next[k]); });
   if (next.backfillFrom !== cur.backfillFrom) setState_('backfillDone', false);
@@ -2441,10 +2448,22 @@ function autoUpdate() {
 }
 
 function github_(path) {
-  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + UPDATE_REPO + path,
-    { muteHttpExceptions: true, headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' } });
-  if (res.getResponseCode() !== 200) throw new Error('GitHub ' + path + ' → HTTP ' + res.getResponseCode());
-  return JSON.parse(res.getContentText());
+  const token = getGithubToken_();
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + UPDATE_REPO + path, { muteHttpExceptions: true, headers: headers });
+  const code = res.getResponseCode();
+  if (code === 200) return JSON.parse(res.getContentText());
+  if (code === 401) throw new Error('GitHub did not accept the saved GitHub token. Replace or remove it in Settings → Updates.');
+  if (code === 403 || code === 429) {
+    // Without a token GitHub allows 60 requests an hour per IP address, and Apps Script shares its addresses with everyone.
+    const h = res.getAllHeaders() || {};
+    const reset = Number(h['X-RateLimit-Reset'] || h['x-ratelimit-reset'] || 0);
+    const when = reset ? ' Try again after ' + Utilities.formatDate(new Date(reset * 1000), getCfg_().timezone, 'HH:mm') + '.' : ' Try again later.';
+    throw new Error(token ? 'GitHub is limiting requests for this token.' + when
+      : 'GitHub limits update checks that come from Google\'s shared servers.' + when + ' To avoid this, add a read-only GitHub token in Settings → Updates.');
+  }
+  throw new Error('GitHub ' + path.split('?')[0] + ' → HTTP ' + code);
 }
 
 /** A file's text at an exact commit, through the GitHub API (not a CDN). */
@@ -2478,6 +2497,9 @@ function scriptApi_(method, path, body) {
   try { json = JSON.parse(res.getContentText() || '{}'); } catch (e) { json = {}; }
   if (code >= 400) {
     const msg = (json.error && json.error.message) || ('HTTP ' + code);
+    if (/has not been used in project|SERVICE_DISABLED/i.test(msg)) {
+      throw new Error('The Apps Script API is off in this script\'s Google Cloud project. Google hides the default project, so link the script to a standard Cloud project (README → "Turn on auto-update"), or set Install updates to Never and update by pasting.');
+    }
     if (/Apps Script API/i.test(msg) || code === 403) {
       throw new Error('Turn on "Google Apps Script API" at https://script.google.com/home/usersettings, then try again. (' + msg + ')');
     }
@@ -3462,7 +3484,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
         autoUpdate: $('#autoUpdate').value, requireVerifiedCommits: $('#requireVerifiedCommits').checked
       };
       if ($$('[data-fmap]').length) cfg.folderMap = map;
-      call('saveSettings', { cfg: cfg, apiKey: $('#key').value.trim() || undefined, aiKey: $('#aikey').value.trim() || undefined }).then(function (st2) {
+      call('saveSettings', { cfg: cfg, apiKey: $('#key').value.trim() || undefined, aiKey: $('#aikey').value.trim() || undefined, githubToken: ($('#ghtoken') && $('#ghtoken').value.trim()) || undefined }).then(function (st2) {
         busy(b, false); S.state = st2; renderTabs(); renderSync(); toast('Settings saved'); go('settings');
       }).catch(function (e) { busy(b, false); fail(e); });
     });
@@ -3613,10 +3635,16 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       field('Install updates', sel('autoUpdate', c.autoUpdate, [['auto', 'Automatically (checks every 6 hours)'], ['ask', 'Ask me first'], ['off', 'Never']]),
         'Source: github.com/' + esc(u.repo) + ', branch ' + esc(u.branch) + '. Running ' + esc(short(u.installed)) + '. ' + esc(status) + (u.last ? ' · Last update ' + esc(ago(u.last.at)) : '')) +
       field('Safety', tog('requireVerifiedCommits', c.requireVerifiedCommits, 'Only install commits that GitHub shows as signed and verified'),
-        'Every update keeps a backup of the old code in Drive (_Life OS system / Code backups) and e-mails you. One-time setup: turn on “Google Apps Script API” at script.google.com/home/usersettings.') +
+        'Every update keeps a backup of the old code in Drive (_Life OS system / Code backups) and e-mails you. One-time setup: see “Turn on auto-update” in the README.') +
+      field('GitHub token', '<div class="inline"><input type="password" id="ghtoken" class="grow" placeholder="' + (u.hasToken ? 'saved, paste to replace' : 'optional: github_pat_…') + '" autocomplete="off">' + (u.hasToken ? '<button class="btn sm" type="button" id="ghclear">Remove</button>' : '') + '</div>',
+        'Optional. GitHub allows only a few anonymous checks an hour from Google\\'s shared servers. A fine-grained token with “Public repositories (read-only)” and no other permissions removes that limit. It cannot change anything on GitHub.') +
       field('Now', '<div class="inline"><button class="btn sm" type="button" id="updcheck">Check now</button><button class="btn sm" type="button" id="updinstall">Install latest</button><button class="btn sm" type="button" id="updrollback">Roll back</button></div><div id="updres" class="small"></div>') +
       '</div></section>';
   }
+  document.addEventListener('click', function (e) {
+    if (!e.target || e.target.id !== 'ghclear') return;
+    call('saveSettings', { clearGithubToken: true }).then(function (st2) { S.state = st2; toast('GitHub token removed'); go('settings'); }).catch(fail);
+  });
   function runUpdate(b, install) {
     busy(b, true, install ? 'Installing…' : 'Checking…');
     call('checkUpdate', { install: install }).then(function (r) {
