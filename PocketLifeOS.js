@@ -3000,7 +3000,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
 .ring .av { width: 100%; height: 100%; border-radius: 50%; border: 3px solid var(--bg); background: var(--sunk); display: grid; place-items: center; font-weight: 600; font-size: 1.05rem; color: var(--fg); }
 .ring.add .av { border: 0; background: none; font-size: 1.6rem; font-weight: 400; color: var(--muted); }
 .story .nm { font-size: .72rem; max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
-.fav, .mwhen { display: none; }
+.fav, .mwhen, .pmeta { display: none; }
 .wordmark { font-family: "Grand Hotel", "Bricolage Grotesque", cursive !important; font-weight: 400 !important; font-size: 1.75rem !important; letter-spacing: 0 !important; line-height: 1 !important; }
 .iconbtn.plain { border: 0; background: none; color: var(--fg); }
 .iconbtn .badge { position: absolute; top: 3px; right: 1px; min-width: 17px; height: 17px; padding: 0 4px; border-radius: 9px; background: var(--rec); color: #fff; font: 600 .62rem/17px var(--font-mono); text-align: center; box-shadow: 0 0 0 2px var(--surface); }
@@ -3091,8 +3091,8 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   .ring.add .av { background: var(--ig-gray); color: var(--fg); font-size: 1.7rem; font-weight: 300; }
   .ring .av { background: hsl(var(--h) 65% 90%); color: hsl(var(--h) 40% 30%); font-weight: 600; font-size: 1.1rem; letter-spacing: .02em; border-color: var(--surface); }
   .story .nm { color: var(--fg); font-size: .74rem; }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .ring .av, :root:not([data-theme="light"]) .row .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); } }
-  :root[data-theme="dark"] .ring .av, :root[data-theme="dark"] .row .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .ring .av, :root:not([data-theme="light"]) .row .fav, :root:not([data-theme="light"]) .ptbl .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); } }
+  :root[data-theme="dark"] .ring .av, :root[data-theme="dark"] .row .fav, :root[data-theme="dark"] .ptbl .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); }
   .row .fav { background: hsl(var(--h) 65% 90%) !important; color: hsl(var(--h) 40% 30%); box-shadow: none !important; width: 38px; height: 38px; font-size: .82rem; }
   .row .mwhen { font-weight: 400; color: var(--muted); font-size: .84rem; }
   .row .mwhen b { color: var(--fg); font-weight: 600; }
@@ -3126,6 +3126,42 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   .panel + .panel, .grid2 > .panel + .panel { border-top: 1px solid var(--line); }
   a { color: var(--fg); }
   .toast { background: #262626; color: #fff; }
+
+  .tbl { overflow: visible; }
+  .tbl table, .tbl tbody, .tbl tr, .tbl td { display: block; width: 100%; }
+  .tbl thead { display: none; }
+  .tbl tr { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .tbl tr:last-child { border-bottom: 0; }
+  .tbl td { padding: 2px 0 !important; border: 0 !important; white-space: normal !important; }
+  .tbl td:first-child { font-weight: 600; }
+  .ptbl tr { display: grid !important; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 10px; align-items: center; }
+  .ptbl td:nth-child(3), .ptbl td:nth-child(4) { display: none !important; }
+  .ptbl td:first-child { display: flex !important; align-items: center; gap: 12px; min-width: 0; }
+  .ptbl td:nth-child(2) { width: auto; }
+  .ptbl td:nth-child(5) { grid-column: 1 / -1; }
+  .ptbl td:nth-child(5) input { height: 38px; font-size: 15px !important; }
+  .ptbl .fav { display: grid; place-items: center; width: 44px; height: 44px; flex: none; border-radius: 50%; font-weight: 600; font-size: .85rem; background: hsl(var(--h) 65% 90%); color: hsl(var(--h) 40% 30%); }
+  .ptbl .pn { display: grid; min-width: 0; }
+  .ptbl .pn b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ptbl .pmeta { display: block !important; font-weight: 400; font-size: .82rem; color: var(--muted); }
+  .ptbl select { border-radius: 8px; font-weight: 600; padding: 6px 10px; }
+  .tbl code { overflow-wrap: anywhere; white-space: normal; }
+  .filerow .inline { flex-direction: column; align-items: stretch; gap: 8px; }
+  .filerow .inline input { width: 100%; flex: none; height: 42px; }
+  .filerow .toggle { display: flex; align-items: center; gap: 8px; align-self: flex-start; color: var(--muted); }
+  .filerow .toggle input { width: 18px; height: 18px; flex: none; margin: 0; }
+  .row .side.fileas { padding-right: 4px; }
+  .row .side.fileas { display: flex; gap: 8px; margin-top: 10px; }
+  .row .side.fileas .btn { flex: 1; min-height: 36px; border: 0; }
+  .row .side.fileas .btn.office { background: var(--ig-blue); color: #fff; }
+  .row .side.fileas .btn.personal { background: var(--ig-gray); color: var(--fg); }
+  .row .side.fileas .btn.pick { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ig-blue); }
+  .row .side.fileas .btn.personal.pick { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--fg); }
+  .suggest { font-size: .84rem; }
+  .person { border: 0; background: var(--ig-gray); border-radius: 14px; }
+  .person .btn { border: 0; }
+  .person .btn.office { background: var(--ig-blue); color: #fff; }
+  .person .btn.personal { background: var(--surface); color: var(--fg); }
 }
 </style>
 
@@ -3362,6 +3398,14 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   }
 
   /* ---------- rows ---------- */
+  function feedHead(people, date, time, fallback) {
+    var first = String(people || '').split(',')[0].trim();
+    return '<span class="fav" style="--h:' + hue(first || fallback) + '" aria-hidden="true">' + esc(first ? initials(first) : '·') + '</span>';
+  }
+  function feedWhen(people, date, time) {
+    var first = String(people || '').split(',')[0].trim();
+    return '<div class="mwhen"><b>' + esc(first || 'No named speakers') + '</b>' + (String(people || '').indexOf(',') > 0 ? ' and others' : '') + ' <span>· ' + esc(nice(date)) + (time ? ', ' + esc(time) : '') + '</span></div>';
+  }
   function convRow(c, expandable) {
     var people = c.people ? '<span>with ' + esc(c.people) + '</span>' : '<span>no named speakers</span>';
     var first = String(c.people || '').split(',')[0].trim();
@@ -3552,13 +3596,13 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
         }).join('') + '</div>' : '<div class="empty">Everyone is known. New names appear here after a sync.</div>') + '</div></section>';
       html += '<section class="panel"><div class="panel-h"><h2>Conversations to file</h2><span class="muted small">' + r.conversations.length + ' unsorted</span></div><div class="list">' +
         (r.conversations.length ? r.conversations.map(function (c) {
-          return '<div class="row"><div class="when"><b>' + esc(c.time) + '</b><span>' + esc(dayLabel(c.date)) + '</span></div><div><div class="t">' + esc(c.title) + '</div>' +
+          return '<div class="row filerow"><div class="when"><b>' + esc(c.time) + '</b><span>' + esc(dayLabel(c.date)) + '</span></div>' + feedHead(c.people, c.date, c.time, c.title) + '<div>' + feedWhen(c.people, c.date, c.time) + '<div class="t">' + esc(c.title) + '</div>' +
             (c.summary ? '<div class="s">' + esc(c.summary.slice(0, 220)) + '</div>' : '') +
             '<div class="meta"><span>' + (c.people ? 'with ' + esc(c.people) : 'no named speakers') + '</span><span class="mono">' + c.durationMin + ' min</span>' + (c.docUrl ? '<a target="_blank" rel="noopener" href="' + esc(c.docUrl) + '">Open doc</a>' : '') + '</div>' +
             (c.aiCategory && c.aiCategory !== 'Unsure' ? '<div class="suggest">Claude suggests ' + chip(c.aiCategory) + ' <span class="muted">' + esc(c.aiReason) + '</span></div>' : '') +
-            '<div class="inline" style="margin-top:10px"><input type="text" id="who-' + esc(c.id) + '" placeholder="Who was it with? (optional, comma-separated)" class="grow">' +
+            '<div class="inline" style="margin-top:10px"><input type="text" id="who-' + esc(c.id) + '" placeholder="Who was it with? (optional)" class="grow">' +
             '<label class="toggle small"><input type="checkbox" id="rem-' + esc(c.id) + '" checked>Remember these people</label></div></div>' +
-            '<div class="side"><button class="btn sm office' + (c.aiCategory === 'Office' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Office">Office</button><button class="btn sm personal' + (c.aiCategory === 'Personal' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Personal">Personal</button></div></div>';
+            '<div class="side fileas"><button class="btn sm office' + (c.aiCategory === 'Office' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Office">Office</button><button class="btn sm personal' + (c.aiCategory === 'Personal' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Personal">Personal</button></div></div>';
         }).join('') : '<div class="empty">Nothing waiting. New conversations Life OS cannot place show up here and in your evening e-mail.</div>') + '</div></section>';
       v.innerHTML = html;
     }).catch(function (e) { v.innerHTML = errorBox(e); });
@@ -3634,7 +3678,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
         busy(b, false);
         var html = '<section class="panel"><div class="panel-h"><h2>Pocket semantic matches</h2><span class="small muted">' + r.pocket.length + '</span></div><div class="list">' +
           (r.pocket.length ? r.pocket.map(function (h) {
-            return '<div class="row"><div class="when"><b class="mono">' + esc((h.date || '').slice(5)) + '</b><span>' + esc((h.date || '').slice(0, 4)) + '</span></div><div><div class="t">' + esc(h.title) + '</div><div class="s">' + esc(h.snippet) + '</div></div><div class="side">' + (h.category ? chip(h.category) : '') + (h.docUrl ? '<a href="' + esc(h.docUrl) + '" target="_blank" rel="noopener" class="small">Doc</a>' : '') + '</div></div>';
+            return '<div class="row"><div class="when"><b class="mono">' + esc((h.date || '').slice(5)) + '</b><span>' + esc((h.date || '').slice(0, 4)) + '</span></div>' + feedHead('', h.date, '', h.title) + '<div><div class="mwhen"><span>' + esc(nice(h.date)) + '</span></div><div class="t">' + esc(h.title) + '</div><div class="s">' + esc(h.snippet) + '</div></div><div class="side">' + (h.category ? chip(h.category) : '') + (h.docUrl ? '<a href="' + esc(h.docUrl) + '" target="_blank" rel="noopener" class="small">Doc</a>' : '') + '</div></div>';
           }).join('') : '<div class="empty">' + (r.pocketError ? esc(r.pocketError) : 'No semantic matches.') + '</div>') + '</div></section>' +
           '<section class="panel"><div class="panel-h"><h2>In your index</h2><span class="small muted">' + r.local.length + '</span></div><div class="list">' +
           (r.local.length ? r.local.map(function (c) { return convRow(c, false); }).join('') : '<div class="empty">No title, person or summary matches.</div>') + '</div></section>';
@@ -3681,9 +3725,9 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
         '<section class="panel"><div class="panel-b"><form id="addp" class="inline"><input type="text" id="pname" placeholder="Add a person, e.g. Daniel Okafor" class="grow" required>' +
         '<select id="pcat" aria-label="Category"><option>Office</option><option>Personal</option></select><button class="btn" type="submit">Add</button></form>' +
         '<div class="small faint" style="margin-top:8px">Names must match how the speaker is named in Pocket. Name a speaker once in the Pocket app and Pocket usually recognises the voice after that.</div></div></section>' +
-        '<section class="panel"><div class="tbl"><table><thead><tr><th>Name</th><th>Category</th><th>Talks</th><th>Last seen</th><th>Notes</th></tr></thead><tbody>' +
+        '<section class="panel"><div class="tbl"><table class="ptbl"><thead><tr><th>Name</th><th>Category</th><th>Talks</th><th>Last seen</th><th>Notes</th></tr></thead><tbody>' +
         (rows.length ? rows.map(function (p) {
-          return '<tr><td><b>' + esc(p.name) + '</b></td><td><select data-pcat="' + esc(p.key) + '" data-name="' + esc(p.name) + '" aria-label="Category for ' + esc(p.name) + '">' +
+          return '<tr><td><span class="fav" style="--h:' + hue(p.name) + '" aria-hidden="true">' + esc(initials(p.name)) + '</span><span class="pn"><b>' + esc(p.name) + '</b><span class="pmeta">' + p.count + ' talk' + (p.count === 1 ? '' : 's') + (p.lastSeen ? ' · ' + esc(nice(p.lastSeen)) : '') + '</span></span></td><td><select data-pcat="' + esc(p.key) + '" data-name="' + esc(p.name) + '" aria-label="Category for ' + esc(p.name) + '">' +
             ['', 'Office', 'Personal', 'Ignore'].map(function (c) { return '<option value="' + c + '"' + (p.category === c ? ' selected' : '') + '>' + (c || 'Ask me') + '</option>'; }).join('') + '</select></td>' +
             '<td class="mono">' + p.count + '</td><td class="mono faint">' + esc(p.lastSeen) + '</td><td><input type="text" data-pnote="' + esc(p.key) + '" data-name="' + esc(p.name) + '" data-cat="' + esc(p.category) + '" value="' + esc(p.notes || '') + '" placeholder="e.g. Northwind, client lead" style="width:100%"></td></tr>';
         }).join('') : '<tr><td colspan="5" class="empty">Nobody yet.</td></tr>') + '</tbody></table></div></section>';
