@@ -553,7 +553,9 @@ function gapi_(method, url, opt) {
     if (code >= 400) {
       let msg = 'HTTP ' + code;
       try { msg = JSON.parse(res.getContentText()).error.message || msg; } catch (e) { /* keep */ }
-      const err = new Error('Google ' + method.toUpperCase() + ' ' + url.split('?')[0].replace(/^https:\/\/[^/]+/, '') + ': ' + msg);
+      // Only the API name and Google's reason: no URLs, file ids or tokens end up in logs.
+      const api = /sheets\.googleapis/.test(url) ? 'Sheets' : /script\.googleapis/.test(url) ? 'Apps Script' : 'Drive';
+      const err = new Error('Google ' + api + ' request failed (HTTP ' + code + '): ' + msg);
       err.httpCode = code;
       throw err;
     }
