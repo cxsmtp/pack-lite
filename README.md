@@ -36,6 +36,10 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 5. **Deploy** → **New deployment** → **Web app**. Set Execute as: **Me** and Who has access: **Only myself**. Open the URL it gives you.
 6. In the dashboard, open **Settings**, paste your Pocket API key (Pocket app → Settings → Developer), then run **Test** → **Preview** → **Sync now**.
 
+## On your phone
+
+Open the dashboard link on your phone. The first time, it shows how to add Life OS to your Home Screen (Safari: Share → Add to Home Screen; Chrome: ⋮ → Add to Home screen). From then on it opens full screen, with a bottom tab bar, a row of the people you talked with most recently, and one-tap upload. The icon comes from `icon.png` in this repo.
+
 ## Updates
 
 The script checks this repo's `main` branch every 6 hours and installs new commits on its own. Before installing, it checks four things. The commit must be signed and verified by GitHub (merges made on github.com are). The code is downloaded through GitHub's API at that exact commit. Its SHA-256 must match the commit's `release.json`, which CI checks on every change. And the file must be complete and recognisably Pocket Life OS. It backs up the old code to Drive (`_Life OS system/Code backups`), keeps every web-app URL and its access setting, and e-mails you. **Settings → Updates** has Check now, Install latest, Roll back, "ask me first" mode, and an option to install only signed, verified commits.
