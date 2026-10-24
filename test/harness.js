@@ -149,14 +149,14 @@ const UrlFetchApp = {
         return resp(200, { success: true, data: slice, pagination: { page, limit, total: l.length, total_pages: Math.ceil(l.length / limit), has_more: page * limit < l.length } }, H);
       }
       let m;
-      if ((m = path.match(/^\/public\/recordings\/(\w+)\/audio-url$/))) { calls.audio++; return resp(200, { success: true, data: { signed_url: 'https://s3.example.com/' + m[1] + '.m4a?sig=1', expires_in: 3600 } }, H); }
+      if ((m = path.match(/^\/public\/recordings\/(\w+)\/audio-url$/))) { calls.audio++; return resp(200, { success: true, data: { signed_url: 'https://pocket-audio.s3.amazonaws.com/' + m[1] + '.m4a?sig=1', expires_in: 3600 } }, H); }
       if ((m = path.match(/^\/public\/recordings\/(\w+)$/))) { calls.detail++; return resp(200, { success: true, data: recordings.find(r => r.id === m[1]) }, H); }
       if (path === '/public/folders') return resp(200, { success: true, data: [{ id: 'fw', name: 'Work', kind: 'space', children: [{ id: 'fc', name: 'Clients', kind: 'folder', children: [] }] }] });
-      if (path === '/public/recordings/upload-url') { const b = JSON.parse(p.payload); uploadReqs.push(b); return resp(200, { success: true, data: { upload_url: 'https://upload.s3.example.com/x?sig=1', recording_id: 'rup1' } }); }
+      if (path === '/public/recordings/upload-url') { const b = JSON.parse(p.payload); uploadReqs.push(b); return resp(200, { success: true, data: { upload_url: 'https://pocket-upload.s3.us-east-1.amazonaws.com/x?sig=1', recording_id: 'rup1' } }); }
       if (path === '/public/search') return resp(200, { success: true, data: [{ recording_id: 'r1', text: 'beta on 4 nov', score: 0.9 }] });
       return resp(404, { success: false, error: 'not found' });
     }
-    if (u.host === 's3.example.com') {
+    if (u.host === 'pocket-audio.s3.amazonaws.com') {
       calls.s3++;
       const big = u.pathname.indexOf('r5') >= 0 || u.pathname.indexOf('r9') >= 0;
       const total = u.pathname.indexOf('r9') >= 0 ? 500 * 1024 * 1024 : big ? 60 * 1024 * 1024 : 1000;
@@ -196,7 +196,7 @@ const UrlFetchApp = {
       if (dm) { const d = gh.deployments.find(x => x.deploymentId === dm[1]); d.deploymentConfig.versionNumber = JSON.parse(p.payload).deploymentConfig.versionNumber; return resp(200, d); }
       return resp(404, {});
     }
-    if (u.host === 'upload.s3.example.com') { uploads.push({ url, ct: p.contentType, method: p.method }); return resp(200, ''); }
+    if (u.host === 'pocket-upload.s3.us-east-1.amazonaws.com') { uploads.push({ url, ct: p.contentType, method: p.method }); return resp(200, ''); }
     if (u.host === 'www.googleapis.com') { calls.upload++; return resp(200, '', { Location: 'https://upload.example.com/session1' }); }
     if (u.host === 'upload.example.com') {
       if (ctxGlobals.__slowUpload) clockOffset += 40000;

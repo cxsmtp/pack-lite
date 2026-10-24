@@ -1189,9 +1189,9 @@ function stripMd_(s) { return String(s).replace(/\*\*|__|`/g, ''); }
 /* ──────────────────────────────── audio ─────────────────────────────────── */
 
 function saveAudio_(ctx, info, folder, base) {
-  const url = getAudioUrl_(info.id);
-  if (!url) throw new Error('Pocket returned no audio URL');
-  assertHttps_(url);
+  const rawUrl = getAudioUrl_(info.id);
+  if (!rawUrl) throw new Error('Pocket returned no audio URL');
+  const url = assertMediaUrl_(rawUrl);
   const probe = UrlFetchApp.fetch(url, { headers: { Range: 'bytes=0-0' }, muteHttpExceptions: true });
   const ph = lowerHeaders_(probe.getAllHeaders());
   if (probe.getResponseCode() >= 400) throw new Error('audio download HTTP ' + probe.getResponseCode());
@@ -2228,10 +2228,10 @@ function processInbox_(ctx) {
       const d = res.data || {};
       const url = d.upload_url || d.uploadUrl || d.signed_url || d.signedUrl || d.url || (typeof d === 'string' ? d : '');
       if (!url) throw new Error('Pocket returned no upload URL');
-      assertHttps_(url);
+      const safeUrl = assertMediaUrl_(url);
       const headers = d.headers && typeof d.headers === 'object' ? d.headers : {};
       delete headers['Content-Type']; delete headers['content-type'];
-      const put = UrlFetchApp.fetch(url, { method: 'put', contentType: type, payload: f.getBlob().getBytes(), headers: headers, muteHttpExceptions: true });
+      const put = UrlFetchApp.fetch(safeUrl, { method: 'put', contentType: type, payload: f.getBlob().getBytes(), headers: headers, muteHttpExceptions: true });
       if (put.getResponseCode() >= 300) throw new Error('upload HTTP ' + put.getResponseCode());
       row.recordingId = d.recording_id || d.recordingId || d.id || (d.recording && d.recording.id) || '';
       row.uploadedAt = nowIso_();
@@ -2507,9 +2507,16 @@ function safeEqual_(a, b) {
   return diff === 0;
 }
 
-function assertHttps_(url) {
-  if (!/^https:\/\/[^\s/]+\//i.test(String(url || ''))) throw new Error('Refusing a non-HTTPS URL');
-  return url;
+// Hosts Pocket hands out signed audio download/upload links for. Anything else is refused (SSRF guard).
+const MEDIA_HOSTS_ = ['amazonaws.com', 'cloudfront.net', 'heypocketai.com', 'heypocket.com', 'storage.googleapis.com'];
+
+/** Returns url only if it is HTTPS on one of the allowed media hosts; throws otherwise. */
+function assertMediaUrl_(url) {
+  const m = String(url || '').match(/^https:\/\/([a-z0-9.-]+)(?::443)?(?:[\/?#]|$)/i);
+  const host = m ? m[1].toLowerCase() : '';
+  const ok = host && MEDIA_HOSTS_.some(function (h) { return host === h || host.slice(-(h.length + 1)) === '.' + h; });
+  if (!ok) throw new Error('Refusing to contact ' + (host || 'a non-HTTPS address') + ': not a known Pocket storage host');
+  return String(url);
 }
 
 /* ─────────────────────────────── triggers ───────────────────────────────── */

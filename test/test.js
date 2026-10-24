@@ -308,3 +308,17 @@ ok(JSON.stringify(H.store.st_webhookQueue || '[]') === qBefore, 'bad recording i
 post5({ event: 'summary.completed', recording: { id: 'r2' } });
 ok(/r2/.test(H.store.st_webhookQueue), 'valid webhook queued');
 console.log('\nALL V5 PASSED');
+
+console.log('\n--- v6: SSRF guard on media URLs ---');
+const G6 = H.G;
+const amu = (u) => { try { return vm6(u); } catch (e) { return 'ERR ' + e.message; } };
+const vm6 = (u) => require('vm').runInContext('assertMediaUrl_(' + JSON.stringify(u) + ')', G6);
+ok(amu('https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1') === 'https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1', 'S3 signed URL allowed');
+ok(amu('https://d1.cloudfront.net/a.m4a') === 'https://d1.cloudfront.net/a.m4a', 'CloudFront allowed');
+ok(/^ERR/.test(amu('http://bucket.s3.amazonaws.com/a')), 'plain http refused');
+ok(/^ERR/.test(amu('https://169.254.169.254/latest/meta-data')), 'metadata IP refused');
+ok(/^ERR/.test(amu('https://evil.com/amazonaws.com/a')), 'look-alike path refused');
+ok(/^ERR/.test(amu('https://amazonaws.com.evil.com/a')), 'look-alike host refused');
+ok(/^ERR/.test(amu('https://user@evil.com/a')), 'userinfo trick refused');
+ok(/^ERR/.test(amu('https://evilamazonaws.com/a')), 'suffix without dot refused');
+console.log('\nALL V6 PASSED');
