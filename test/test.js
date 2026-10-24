@@ -310,9 +310,8 @@ ok(/r2/.test(H.store.st_webhookQueue), 'valid webhook queued');
 console.log('\nALL V5 PASSED');
 
 console.log('\n--- v6: SSRF guard on media URLs ---');
-const G6 = H.G;
 const amu = (u) => { try { return vm6(u); } catch (e) { return 'ERR ' + e.message; } };
-const vm6 = (u) => require('vm').runInContext('assertMediaUrl_(' + JSON.stringify(u) + ')', G6);
+const vm6 = (u) => A.assertMediaUrl_(u);
 ok(amu('https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1') === 'https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1', 'S3 signed URL allowed');
 ok(amu('https://d1.cloudfront.net/a.m4a') === 'https://d1.cloudfront.net/a.m4a', 'CloudFront allowed');
 ok(/^ERR/.test(amu('http://bucket.s3.amazonaws.com/a')), 'plain http refused');

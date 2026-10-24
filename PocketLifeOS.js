@@ -2645,6 +2645,11 @@ function sha256Hex_(s) {
 }
 function hash_(s) { return sha256Hex_(s).slice(0, 12); }
 
+/* Lets the Node test suite load this file as a module. Apps Script has no `module`, so this does nothing there. */
+if (typeof module === 'object' && module && module.exports) {
+  module.exports = { setup: setup, syncNow: syncNow, api: api, doPost: doPost, dailyDigest: dailyDigest, normalize_: normalize_, parseRpc_: parseRpc_, assertMediaUrl_: assertMediaUrl_, UI_HTML_: UI_HTML_ };
+}
+
 /* ─────────────────────────── dashboard (HTML) ─────────────────────────── */
 
 /** The dashboard page. Open the script file and search for this function to restyle it. */

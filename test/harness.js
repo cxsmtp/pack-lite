@@ -1,10 +1,8 @@
 // Simulates Google Apps Script services + Pocket API to exercise PocketLifeOS.gs end to end.
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 const crypto = require('crypto');
 const SCRIPT_PATH = path.join(__dirname, '..', 'PocketLifeOS.js');   // fixed: the harness only ever loads this repo's script
-const code = fs.readFileSync(SCRIPT_PATH, 'utf8');
 const log = [];
 let idc = 0; const nid = (p) => p + (++idc);
 
@@ -280,7 +278,8 @@ const Tasks = {
 const triggers = [];
 function trig(fn) { return chain({ fn, timeBased() { return chain(this); }, create() { triggers.push(fn); return this; } }); }
 let clockOffset = 0;
-class FakeDate extends Date { constructor(...a) { if (a.length) super(...a); else super(Date.now() + clockOffset); } static now() { return Date.now() + clockOffset; } }
+const RealDate = Date;
+class FakeDate extends RealDate { constructor(...a) { if (a.length) super(...a); else super(RealDate.now() + clockOffset); } static now() { return RealDate.now() + clockOffset; } }
 const ctxGlobals = {
   advance: (ms) => { clockOffset += ms; },
   console, JSON, Date: FakeDate, Math, Object, Array, String, Number, RegExp, Error, encodeURIComponent, parseInt,
@@ -308,6 +307,9 @@ const ctxGlobals = {
   HtmlService: { createHtmlOutput: (h) => chain({ html: h }) }, ContentService: { createTextOutput: (t) => t },
   Logger: { log: (m) => log.push(m) }
 };
-vm.createContext(ctxGlobals);
-vm.runInContext(code + '\n;this.__api = { setup, syncNow, api, doPost, dailyDigest, normalize_, parseRpc_, UI_HTML_ };', ctxGlobals);
+// Expose the fake Google services as globals, then load the script as an ordinary module (no eval / vm).
+['PropertiesService', 'Session', 'Utilities', 'LockService', 'ScriptApp', 'UrlFetchApp', 'Tasks', 'MailApp', 'HtmlService', 'ContentService', 'Logger']
+  .forEach(k => { global[k] = ctxGlobals[k]; });
+global.Date = FakeDate;
+ctxGlobals.__api = require(SCRIPT_PATH);
 module.exports = { SCRIPT_PATH, gh, scriptCalls, mkFile, aiCalls, uploads, uploadReqs, G: ctxGlobals, items, sheets, GDOC, taskStore, mcpCalls, calls, triggers, log, store, recordings };
