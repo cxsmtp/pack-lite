@@ -9,6 +9,11 @@ One file — [`PocketLifeOS.gs`](PocketLifeOS.gs) — that runs inside your own 
 - `_Claude Memory` folder (Timeline, People directory, monthly Memory docs) so a Claude Project can answer "what did I discuss with whom, and when".
 - Private dashboard for phone and laptop: Review, Conversations, To-dos, Ask, People, Settings, Playbook.
 - Runs every 15 minutes in Google's cloud, so your laptop and phone can be off.
+- **Drive inbox**: drop any audio file (Zoom export, voice memo, USB copy from the device, up to 48 MB) into `_Inbox — drop audio here`. It is sent to Pocket for transcription and comes back filed.
+- **Optional Claude API key** (replaces Pocket Pro): Claude notes from your own Office/Personal templates, a choice of Opus/Sonnet/Haiku, Ask across your whole archive, a weekly review, and the promises you made turned into to-dos.
+- **Phone shortcuts** (iPhone Shortcuts, Android HTTP Shortcuts): *Ask my memory*, *Add to-do*, *Status*, *Sync now*.
+
+The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project setup and step-by-step phone shortcut recipes.
 
 ## Install (about 5 minutes)
 
