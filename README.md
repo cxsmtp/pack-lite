@@ -29,6 +29,8 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
    - run on a schedule
    - call Pocket, GitHub and Claude
    - update itself (auto-update)
+
+   It also switches on the Drive and Sheets APIs for the script. Life OS calls them directly so it can work with the narrow `drive.file` permission. Without them, setup stops with "Google Sheets API has not been used in project … or it is disabled".
 3. Turn on **Google Apps Script API** at https://script.google.com/home/usersettings. Auto-update needs it.
 4. Choose `setup` → **Run**, then allow the permissions. Google warns because the script is yours and unpublished; that is expected.
 5. **Deploy** → **New deployment** → **Web app**. Set Execute as: **Me** and Who has access: **Only myself**. Open the URL it gives you.
