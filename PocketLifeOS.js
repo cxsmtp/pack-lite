@@ -89,7 +89,7 @@ const DEFAULT_CFG = {
   inboxAudio: 'pocket',        // audio with no transcript next to it: 'pocket' = send to Pocket, 'keep' = archive only
   preferredApp: 'claude',
   autoUpdate: 'auto',          // auto | ask | off: install new code from GitHub main
-  requireVerifiedCommits: false, // only install commits GitHub shows as signed and verified      // claude | chatgpt | gemini | gemini-docs, for the no-API-key "Send to" buttons
+  requireVerifiedCommits: true, // only install commits GitHub shows as signed and verified (PR merges on github.com are)      // claude | chatgpt | gemini | gemini-docs, for the no-API-key "Send to" buttons
 
   // Claude (optional; needs an Anthropic API key from console.anthropic.com)
   aiModel: 'claude-opus-5-5',
@@ -2338,6 +2338,7 @@ const UPDATE_REPO = 'cxsmtp/pack-lite';
 const UPDATE_BRANCH = 'main';
 const UPDATE_FILE = 'PocketLifeOS.js';
 const UPDATE_MARKER = "const APP_NAME = 'Pocket Life OS';";
+const UPDATE_RELEASE = 'release.json';   // { "file": "PocketLifeOS.js", "sha256": "<hex>" }, written by the build, checked by CI
 const SCRIPT_API = 'https://script.googleapis.com/v1/projects/';
 
 /** Time-driven trigger (every 6 hours). */
@@ -2347,11 +2348,31 @@ function autoUpdate() {
   try { checkForUpdate_(cfg.autoUpdate === 'auto'); } catch (e) { console.error(e); }
 }
 
-function github_(path, raw) {
-  const url = raw ? 'https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + path : 'https://api.github.com/repos/' + UPDATE_REPO + path;
-  const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, headers: { Accept: raw ? 'text/plain' : 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' } });
+function github_(path) {
+  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + UPDATE_REPO + path,
+    { muteHttpExceptions: true, headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' } });
   if (res.getResponseCode() !== 200) throw new Error('GitHub ' + path + ' → HTTP ' + res.getResponseCode());
-  return raw ? res.getContentText() : JSON.parse(res.getContentText());
+  return JSON.parse(res.getContentText());
+}
+
+/** A file's text at an exact commit, through the GitHub API (not a CDN). */
+function githubFile_(name, sha) {
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('Unexpected commit id from GitHub');
+  const f = github_('/contents/' + encodeURIComponent(name) + '?ref=' + sha);
+  if (f.encoding !== 'base64' || !f.content) throw new Error(name + ' is missing or too large in commit ' + sha.slice(0, 7));
+  return Utilities.newBlob(Utilities.base64Decode(String(f.content).replace(/\s+/g, ''))).getDataAsString('UTF-8');
+}
+
+/** Downloads the code for a commit and refuses it unless its SHA-256 matches the commit's release.json. */
+function downloadVerified_(sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error('Unexpected commit id from GitHub; update skipped');
+  let release;
+  try { release = JSON.parse(githubFile_(UPDATE_RELEASE, sha)); } catch (e) { throw new Error('No valid ' + UPDATE_RELEASE + ' in commit ' + sha.slice(0, 7) + '; update skipped'); }
+  if (release.file !== UPDATE_FILE || !/^[0-9a-f]{64}$/.test(String(release.sha256))) throw new Error(UPDATE_RELEASE + ' is malformed; update skipped');
+  const source = githubFile_(UPDATE_FILE, sha);
+  const actual = sha256Hex_(source);
+  if (!safeEqual_(actual, release.sha256)) throw new Error('Integrity check failed: the downloaded code does not match its published SHA-256; update skipped');
+  return source;
 }
 
 function scriptApi_(method, path, body) {
@@ -2387,7 +2408,7 @@ function checkForUpdate_(apply) {
     setState_('updateCheck', Object.assign({ at: nowIso_() }, st));
     return st;
   }
-  return Object.assign(st, installFromSource_(github_(st.latest + '/' + UPDATE_FILE, true), st.latest, st.message));
+  return Object.assign(st, installFromSource_(downloadVerified_(st.latest), st.latest, st.message));
 }
 
 /** Validates, backs up, installs, versions and redeploys. */
@@ -2521,10 +2542,11 @@ function localDate_(ymd) { const p = ymd.split('-').map(Number); return new Date
 function hms_(sec) { sec = Math.floor(Number(sec) || 0); const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60; return (h ? h + ':' : '') + (h && m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s; }
 function fmtDuration_(sec) { const m = Math.round(sec / 60); return m >= 60 ? Math.floor(m / 60) + ' h ' + (m % 60) + ' min' : m + ' min'; }
 function unique_(a) { return a.filter(function (x, i) { return a.indexOf(x) === i; }); }
-function hash_(s) {
-  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s).slice(0, 6)
+function sha256Hex_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8)
     .map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
 }
+function hash_(s) { return sha256Hex_(s).slice(0, 12); }
 
 /* ─────────────────────────── dashboard (HTML) ─────────────────────────── */
 
@@ -3689,7 +3711,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     });
     var cfg = { rootFolderName: 'Life OS — Conversations', timezone: 'Asia/Kolkata', myNames: 'Me', syncEveryMinutes: 15, saveAudio: true, saveTranscript: true, todosTo: 'tasks', defaultDueDays: 1, todoMaxAgeDays: 14,
       pushCompletionToPocket: true, dailyDigest: true, digestHour: 20, mixedRule: 'office', aiModel: 'claude-opus-5-5', aiNotes: true, aiCommitments: true, aiAutoFile: false, weeklyReview: true, weeklyDay: 'SUNDAY', weeklyHour: 18, aiMaxAgeDays: 30,
-      templateOffice: 'Decisions: what was decided and by whom\\nCommitments: who promised what to whom, with dates\\nRisks and open questions\\nNext steps', templatePersonal: 'Plans and dates\\nThings I promised\\nHealth, money and admin details worth keeping\\nFollow-ups', inbox: true, inboxAudio: 'pocket', preferredApp: 'claude', autoUpdate: 'auto', requireVerifiedCommits: false, publicUrl: '', phoneAsk: true, rules: 'office: standup, sprint, client, invoice, deadline, roadmap\\npersonal: mom, dad, family, gym, doctor, birthday', folderMap: {}, backfillFrom: '', webhookToken: 'sample-token-1234', claudeDone: false };
+      templateOffice: 'Decisions: what was decided and by whom\\nCommitments: who promised what to whom, with dates\\nRisks and open questions\\nNext steps', templatePersonal: 'Plans and dates\\nThings I promised\\nHealth, money and admin details worth keeping\\nFollow-ups', inbox: true, inboxAudio: 'pocket', preferredApp: 'claude', autoUpdate: 'auto', requireVerifiedCommits: true, publicUrl: '', phoneAsk: true, rules: 'office: standup, sprint, client, invoice, deadline, roadmap\\npersonal: mom, dad, family, gym, doctor, birthday', folderMap: {}, backfillFrom: '', webhookToken: 'sample-token-1234', claudeDone: false };
     var ratings = { claude: { count: 2, sum: 6 }, chatgpt: { count: 2, sum: 4 } };
     var lastSync = { ok: true, at: new Date(Date.now() - 6 * 60000).toISOString(), message: '2 new · 3 to-dos · 2 audio files' };
     function stats() {

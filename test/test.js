@@ -230,44 +230,56 @@ A.api('sync');
 ok(H.uploadReqs.length === beforeUp && A.api('conversations', { q: 'Voice memo' }).total === 1, 'keep mode archives audio without Pocket');
 console.log('\nALL V3 PASSED');
 
-console.log('\n--- v4: auto-update, token hardening ---');
-const src = fs.readFileSync((process.argv[2] || require('path').join(__dirname, '..', 'PocketLifeOS.js')), 'utf8');
+console.log('\n--- v4: auto-update with integrity checks, token hardening ---');
+const src = fs.readFileSync(H.SCRIPT_PATH, 'utf8');
 const gh = H.gh;
-// Life OS code currently "installed" in the project
+const SHA = (c) => c.repeat(40);
 gh.files[0].source = src.replace("const APP_VERSION = '1.0.0';", "const APP_VERSION = '0.9.0';");
 gh.file = src;
 const chk = A.api('checkUpdate', {});
-ok(chk.latest === 'aaaa111' && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
+ok(chk.latest === SHA('a') && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
 ok(H.triggers.includes('autoUpdate'), 'autoUpdate trigger installed');
+const blk0 = A.api('checkUpdate', { install: true });
+ok(blk0.blocked && gh.files[0].source !== src, 'unsigned commit blocked by default');
+gh.head.commit.verification.verified = true;
 const ins = A.api('checkUpdate', { install: true });
 console.log('   ', ins.message);
-ok(ins.applied && gh.files[0].source === src, 'new code written to the project');
+ok(ins.applied && gh.files[0].source === src, 'verified commit with matching SHA-256 installed');
 ok(gh.deployments.find(d => d.deploymentId === 'DASH').deploymentConfig.versionNumber === 4 && gh.deployments.find(d => d.deploymentId === 'PHONE').deploymentConfig.versionNumber === 5, 'each deployment moved to its own new version');
 ok(/"access": "MYSELF"/.test(gh.versionManifests[4]) && /"access": "ANYONE_ANONYMOUS"/.test(gh.versionManifests[5]) && /Asia\/Kolkata/.test(gh.versionManifests[4]), 'access settings + time zone preserved per deployment');
 ok(gh.deployments.find(d => d.deploymentId === 'HEADDEP').deploymentConfig.versionNumber === undefined, 'HEAD deployment untouched');
 const bk = Object.values(H.items).find(i => i.kind === 'folder' && i.name === 'Code backups');
 ok(bk && Object.values(H.items).some(i => i.parent === bk.id && i.text && /0\.9\.0/.test(i.text)), 'previous code backed up to Drive');
 ok(A.api('checkUpdate', {}).upToDate, 'up to date after install');
-// bad download
-gh.head.sha = 'bbbb222'; gh.file = '<html>404</html>';
-let threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
-ok(/does not look like Pocket Life OS/.test(threw) && gh.files[0].source === src, 'bad download refused, code unchanged');
+let threw = '';
+// tampered download: served file differs from the one release.json describes
+gh.head.sha = SHA('b'); gh.file = src.replace('1.0.0', '1.0.1'); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/Integrity check failed/.test(threw) && gh.files[0].source === src, 'tampered code refused (SHA-256 mismatch)');
+delete gh.served;
+gh.release = 'not json';
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/No valid release.json/.test(threw), 'missing/invalid release.json refused');
+gh.release = JSON.stringify({ file: 'other.js', sha256: 'x' });
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/malformed/.test(threw), 'malformed release.json refused');
+delete gh.release;
+gh.file = '<html>404</html>';
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/does not look like Pocket Life OS/.test(threw) && gh.files[0].source === src, 'non-script file refused even with matching hash');
 gh.file = src.slice(0, src.length - 500);
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/truncated/.test(threw), 'truncated download refused');
-// unsigned commits blocked when required
-A.api('saveSettings', { cfg: { requireVerifiedCommits: true } });
-gh.file = src.replace("1.0.0", "1.0.1");
-const blk = A.api('checkUpdate', { install: true });
-ok(blk.blocked && gh.files[0].source === src, 'unsigned commit blocked when verification required');
-gh.head.commit.verification.verified = true;
-ok(A.api('checkUpdate', { install: true }).applied, 'verified commit installs');
-A.api('saveSettings', { cfg: { requireVerifiedCommits: false } });
+gh.head.sha = 'not-a-sha';
+threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
+ok(/Unexpected commit id/.test(threw), 'malformed commit id refused');
+gh.head.sha = SHA('c'); gh.file = src.replace('1.0.0', '1.0.1');
+ok(A.api('checkUpdate', { install: true }).applied, 'next verified update installs');
 // rollback
 const rb = A.api('rollback');
 ok(rb.applied && gh.files[0].source === src, 'rollback restores the previous code');
 // API switched off
-gh.apiOff = true; gh.head.sha = 'cccc333'; gh.file = src.replace('1.0.0', '1.0.2');
+gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace('1.0.0', '1.0.2');
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;

@@ -29,7 +29,7 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 
 ## Updates
 
-The script checks this repo's `main` branch every 6 hours and installs new commits on its own. Before installing, it checks that the download is the real file and isn't truncated. It backs up the old code to Drive (`_Life OS system/Code backups`), keeps every web-app URL and its access setting, and e-mails you. **Settings → Updates** has Check now, Install latest, Roll back, "ask me first" mode, and an option to install only signed, verified commits.
+The script checks this repo's `main` branch every 6 hours and installs new commits on its own. Before installing, it checks four things. The commit must be signed and verified by GitHub (merges made on github.com are). The code is downloaded through GitHub's API at that exact commit. Its SHA-256 must match the commit's `release.json`, which CI checks on every change. And the file must be complete and recognisably Pocket Life OS. It backs up the old code to Drive (`_Life OS system/Code backups`), keeps every web-app URL and its access setting, and e-mails you. **Settings → Updates** has Check now, Install latest, Roll back, "ask me first" mode, and an option to install only signed, verified commits.
 
 ## Security
 
