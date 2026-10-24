@@ -43,7 +43,7 @@ const docs = {};
 function mkEl(type, text) {
   return chain({ type, text: text || '', heading: '', getType() { return type === 'li' ? 'LIST_ITEM' : type === 'p' ? 'PARAGRAPH' : 'TABLE'; },
     setHeading(h) { this.heading = h; return chain(this); }, getHeading() { return this.heading; }, copy() { return mkEl(type, this.text); },
-    asListItem() { return chain(this); }, asTable() { return chain(this); }, setText(t) { this.text = t; return chain(this); }, getText() { return this.text; }, editAsText() { return chain({ getText: () => this.text }); },
+    asListItem() { return chain(this); }, asTable() { return chain(this); }, setText(t) { this.text = t; return undefined; /* like Apps Script: Paragraph/ListItem.setText returns void */ }, getText() { return this.text; }, editAsText() { return chain({ getText: () => this.text }); },
     asParagraph() { return chain(this); } });
 }
 const DocumentApp = {

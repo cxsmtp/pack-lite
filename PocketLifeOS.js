@@ -1054,7 +1054,7 @@ function writeDoc_(ctx, info, cls, docId, folder, name, audioUrl) {
   body.setMarginTop(48).setMarginBottom(48);
 
   const title = body.getChild(0).asParagraph();
-  title.setText((info.emoji ? info.emoji + ' ' : '') + info.title).setHeading(D.ParagraphHeading.TITLE);
+  title.setHeading(D.ParagraphHeading.TITLE).setText((info.emoji ? info.emoji + ' ' : '') + info.title);
 
   const when = info.weekday + ', ' + fmt_(ctx, info.start, 'd MMMM yyyy') + ' · ' + info.time + '–' + info.endTime + ' (' + ctx.tz + ')';
   const meta = [
@@ -1385,7 +1385,7 @@ function ensureClaudeReadme_(ctx) {
   const doc = DocumentApp.create('00 — READ ME FIRST (instructions for Claude)');
   DriveApp.getFileById(doc.getId()).moveTo(memoryFolder_(ctx));
   const b = doc.getBody();
-  b.getChild(0).asParagraph().setText('How to use this archive (for Claude)').setHeading(DocumentApp.ParagraphHeading.TITLE);
+  b.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.TITLE).setText('How to use this archive (for Claude)');
   CLAUDE_INSTRUCTIONS_().split('\n').forEach(function (l) { if (l.trim()) b.appendParagraph(l); });
   doc.saveAndClose();
   ids.readme = doc.getId();
@@ -1441,7 +1441,7 @@ function writeMonthDoc_(ctx, month, rows, todosByConv) {
   const label = Utilities.formatDate(new Date(month + '-15T12:00:00Z'), 'Etc/UTC', 'MMMM yyyy');
   const doc = memoryDoc_(ctx, 'm' + month, 'Memory — ' + month + ' (' + label + ')');
   const b = doc.getBody();
-  b.getChild(0).asParagraph().setText('Conversations — ' + label).setHeading(D.ParagraphHeading.TITLE);
+  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('Conversations — ' + label);
   b.appendParagraph(rows.length + ' conversations · ' + Math.round(rows.reduce(function (s, r) { return s + Number(r.durationMin || 0); }, 0) / 6) / 10 + ' hours · times in ' + ctx.tz)
     .editAsText().setForegroundColor('#64748b');
   rows.forEach(function (r) {
@@ -1464,7 +1464,7 @@ function writeTimelineDoc_(ctx, rows) {
   const D = DocumentApp;
   const doc = memoryDoc_(ctx, 'timeline', 'Timeline — all conversations');
   const b = doc.getBody();
-  b.getChild(0).asParagraph().setText('Timeline of every conversation').setHeading(D.ParagraphHeading.TITLE);
+  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('Timeline of every conversation');
   b.appendParagraph('Format: date time–end · category · with people · title · minutes. Newest first. Times in ' + ctx.tz + '.').editAsText().setForegroundColor('#64748b');
   let month = '';
   rows.slice().reverse().forEach(function (r) {
@@ -1483,7 +1483,7 @@ function writePeopleDoc_(ctx) {
   const D = DocumentApp;
   const doc = memoryDoc_(ctx, 'people', 'People directory');
   const b = doc.getBody();
-  b.getChild(0).asParagraph().setText('People I talk to').setHeading(D.ParagraphHeading.TITLE);
+  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('People I talk to');
   ['Office', 'Personal', ''].forEach(function (cat) {
     const list = ctx.people.rows.filter(function (p) { return (p.category || '') === cat && cat !== 'Ignore'; })
       .sort(function (a, b2) { return Number(b2.count) - Number(a.count); });
@@ -2038,7 +2038,7 @@ function writeWeeklyReview_(ctx, email) {
   const doc = DocumentApp.create(title);
   DriveApp.getFileById(doc.getId()).moveTo(folderPath_(ctx, [MEMORY_FOLDER, 'Weekly reviews']));
   const b = doc.getBody();
-  b.getChild(0).asParagraph().setText(title).setHeading(DocumentApp.ParagraphHeading.TITLE);
+  b.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.TITLE).setText(title);
   renderMarkdown_(b, text);
   doc.saveAndClose();
   const url = 'https://docs.google.com/document/d/' + doc.getId() + '/edit';
@@ -2150,7 +2150,7 @@ function apiSaveResult_(args) {
   }
   const tmp = DocumentApp.create('tmp');
   const tb = tmp.getBody();
-  tb.getChild(0).asParagraph().setText(label + ' — from ' + APP_LABELS_[app] + ', ' + stamp).setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  tb.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.HEADING1).setText(label + ' — from ' + APP_LABELS_[app] + ', ' + stamp);
   renderMarkdown_(tb, text);
   const n = tb.getNumChildren();
   for (let i = 0; i < n; i++) {
