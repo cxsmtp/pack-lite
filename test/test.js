@@ -49,7 +49,8 @@ ok(docNames.some(n => /Standup — with Priya Raman\.m4a$/.test(n)), 'audio name
 const mem = Object.values(H.items).filter(i => i.kind === 'folder' && i.name === '_Claude Memory')[0];
 ok(mem && Object.values(H.items).filter(i => i.parent === mem.id).length >= 4, 'memory docs written');
 // formula escape
-const docText = Object.values(H.docs).map(d => d.d.body.children.map(c => c.text || '').join('\n')).join('\n');
+const docTextAll = () => Object.values(H.items).filter(i => i.mime === H.GDOC).map(i => i.text.replace(/<[^>]+>/g, '').replace(/&#39;/g, "'").replace(/&amp;/g, '&')).join('\n');
+const docText = docTextAll();
 ok(/Priya Raman: Morning. =SUM/.test(docText), 'transcript rendered');
 
 console.log('sync #2 idempotent');
@@ -129,7 +130,7 @@ const r1n = convRows.find(x => x[0] === 'r1');
 ok(r1n[hdr.indexOf('Claude notes')] === 'done' && r1n[hdr.indexOf('Claude suggests')] === 'Office', 'r1 has Claude notes + suggestion');
 const tdAll = A.api('todos', { status: 'all' });
 ok(tdAll.some(t => t.source === 'Claude' && /Send QA plan \(promised to Priya Raman\)/.test(t.title)), 'commitment became a to-do');
-const docTxt = Object.values(H.docs).map(d => d.d.body.children.map(c => c.text || '').join('\n')).join('\n');
+const docTxt = docTextAll();
 ok(/Claude notes/.test(docTxt) && /What I promised/.test(docTxt), 'doc has Claude notes section');
 const again = H.aiCalls.length; A.api('sync');
 ok(H.aiCalls.length === again, 'no repeat Claude calls when nothing changed');
@@ -199,9 +200,8 @@ ok(/weekly review/.test(A.api('promptFor', { kind: 'week' }).prompt), 'week prom
 // paste back
 const sr = A.api('saveResult', { id: 'r1', kind: 'notes', app: 'chatgpt', text: '## Decisions\n- **Ship** beta', rating: 3 });
 ok(sr.ok && sr.ratings.chatgpt.count === 1, 'saved + rated');
-const r1doc = Object.values(H.docs).find(d => /Standup/.test(d.d.getName()));
-const kids = r1doc.d.body.children.map(c => c.text);
-const iNotes = kids.findIndex(t => /Notes — from ChatGPT/.test(t)), iTr = kids.indexOf('Transcript');
+const r1doc = Object.values(H.items).find(i => i.mime === H.GDOC && /Standup/.test(i.name));
+const iNotes = r1doc.text.indexOf('Notes — from ChatGPT'), iTr = r1doc.text.indexOf('>Transcript<');
 ok(iNotes > 0 && iNotes < iTr, 'pasted notes inserted before transcript');
 ok(A.api('conversation', { id: 'r1' }).conv.hasExtNotes, 'ext notes stored');
 ok(/Ship/.test(A.api('claudePrompt', { question: 'ship beta' }).prompt), 'Ask includes pasted notes');
@@ -308,3 +308,40 @@ ok(JSON.stringify(H.store.st_webhookQueue || '[]') === qBefore, 'bad recording i
 post5({ event: 'summary.completed', recording: { id: 'r2' } });
 ok(/r2/.test(H.store.st_webhookQueue), 'valid webhook queued');
 console.log('\nALL V5 PASSED');
+
+console.log('\n--- v6: SSRF guard on media URLs ---');
+const amu = (u) => { try { return vm6(u); } catch (e) { return 'ERR ' + e.message; } };
+const vm6 = (u) => A.assertMediaUrl_(u);
+ok(amu('https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1') === 'https://bucket.s3.amazonaws.com/a.m4a?X-Amz-Signature=1', 'S3 signed URL allowed');
+ok(amu('https://d1.cloudfront.net/a.m4a') === 'https://d1.cloudfront.net/a.m4a', 'CloudFront allowed');
+ok(/^ERR/.test(amu('http://bucket.s3.amazonaws.com/a')), 'plain http refused');
+ok(/^ERR/.test(amu('https://169.254.169.254/latest/meta-data')), 'metadata IP refused');
+ok(/^ERR/.test(amu('https://evil.com/amazonaws.com/a')), 'look-alike path refused');
+ok(/^ERR/.test(amu('https://amazonaws.com.evil.com/a')), 'look-alike host refused');
+ok(/^ERR/.test(amu('https://user@evil.com/a')), 'userinfo trick refused');
+ok(/^ERR/.test(amu('https://evilamazonaws.com/a')), 'suffix without dot refused');
+console.log('\nALL V6 PASSED');
+
+
+console.log('\n--- v7: drive.file only, dashboard upload ---');
+const scriptSrc = fs.readFileSync(H.SCRIPT_PATH, 'utf8').split('function UI_HTML_')[0];
+ok(!/\b(DriveApp|DocumentApp|SpreadsheetApp|CalendarApp)\./.test(scriptSrc), 'script never uses DriveApp/DocumentApp/SpreadsheetApp/CalendarApp');
+const manifest = JSON.parse(fs.readFileSync(require('path').join(__dirname, '..', 'appsscript.json'), 'utf8'));
+ok(manifest.oauthScopes.includes('https://www.googleapis.com/auth/drive.file') &&
+   !manifest.oauthScopes.some(x => /auth\/(drive|documents|spreadsheets|calendar)$/.test(x)), 'manifest asks for drive.file only (no full Drive/Docs/Sheets/Calendar)');
+// a file the user put in Drive themselves is invisible to the script
+const foreign = H.mkFile('My private tax return.pdf', 'root'); foreign.mime = 'application/pdf';
+const upBefore = H.uploadReqs.length;
+const up = A.api('uploadToInbox', { name: 'Voice memo 2026-10-25 09.10.m4a', data: Buffer.from('AUDIO').toString('base64') });
+ok(up.ok && up.size === 5, 'dashboard upload stored in the inbox');
+let upErr = ''; try { A.api('uploadToInbox', { name: 'evil.exe', data: 'QUJD' }); } catch (e) { upErr = e.message; }
+ok(/Choose an audio file/.test(upErr), 'non-audio upload refused');
+upErr = ''; try { A.api('uploadToInbox', { name: 'a.m4a', data: 'not base64!' }); } catch (e) { upErr = e.message; }
+ok(/could not be read/.test(upErr), 'malformed upload refused');
+A.api('saveSettings', { cfg: { inboxAudio: 'pocket' } });
+A.api('sync');
+ok(H.uploadReqs.length === upBefore + 1 && /Voice memo 2026-10-25/.test(H.uploadReqs[H.uploadReqs.length - 1].file_name), 'uploaded memo sent to Pocket on next sync');
+ok(foreign.parent === 'root' && !foreign.trashed && foreign.name === 'My private tax return.pdf', 'files outside Life OS untouched');
+const convSheet = Object.values(H.sheets)[0].getSheetByName('Conversations').data;
+ok(convSheet.every(r => r.every(c => typeof c === 'string')), 'index sheet written RAW (strings only)');
+console.log('\nALL V7 PASSED');

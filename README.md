@@ -9,7 +9,8 @@ One file — [`PocketLifeOS.js`](PocketLifeOS.js) — that runs inside your own 
 - `_Claude Memory` folder (Timeline, People directory, monthly Memory docs) so a Claude Project can answer "what did I discuss with whom, and when".
 - Private dashboard for phone and laptop: Review, Conversations, To-dos, Ask, People, Settings, Playbook.
 - Runs every 15 minutes in Google's cloud, so your laptop and phone can be off.
-- **Drive inbox**: drop any audio file (Zoom export, voice memo, USB copy from the device, up to 48 MB) into `_Inbox — drop audio here`. It is sent to Pocket for transcription and comes back filed.
+- **Least privilege**: Google gives the script `drive.file` access only. It can see and change the files and folders it creates, and nothing else in your Drive. There's no access to your other Docs, Sheets or Calendar.
+- **Upload button**: any audio file (Zoom export, voice memo, USB copy from the device, up to 30 MB) or transcript can be uploaded from the dashboard. Audio is sent to Pocket for transcription and comes back filed.
 - **Optional Claude API key** (replaces Pocket Pro): Claude notes from your own Office/Personal templates, a choice of Opus/Sonnet/Haiku, Ask across your whole archive, a weekly review, and the promises you made turned into to-dos.
 - **No API keys needed**: every conversation has *Send to Claude / ChatGPT / Gemini / Gemini in Docs*. It copies the transcript and your template, then opens the app you already pay for. Paste the answer back, rate it, and pick your favourite.
 - **Long recordings**: audio of any length is saved to Drive, resuming across runs. Conversations where Pocket's transcript stops early are flagged, with a *Transcribe the rest* action.
@@ -21,7 +22,13 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 ## Install (about 5 minutes, no command line)
 
 1. Go to https://script.google.com → **New project**. Paste the whole of `PocketLifeOS.js` into the code file and save.
-2. **Project Settings** (gear icon) → tick **Show "appsscript.json" manifest file in editor**. Open `appsscript.json` and replace its contents with this repo's [`appsscript.json`](appsscript.json). This adds the Google Tasks service and the permissions, including the ones auto-update needs.
+2. **Project Settings** (gear icon) → tick **Show "appsscript.json" manifest file in editor**. Open `appsscript.json` and replace its contents with this repo's [`appsscript.json`](appsscript.json). Keep your own `timeZone` line. The manifest lists the only permissions the script gets:
+   - `drive.file`: only the files it creates
+   - Google Tasks
+   - send mail to you
+   - run on a schedule
+   - call Pocket, GitHub and Claude
+   - update itself (auto-update)
 3. Turn on **Google Apps Script API** at https://script.google.com/home/usersettings. Auto-update needs it.
 4. Choose `setup` → **Run**, then allow the permissions. Google warns because the script is yours and unpublished; that is expected.
 5. **Deploy** → **New deployment** → **Web app**. Set Execute as: **Me** and Who has access: **Only myself**. Open the URL it gives you.
@@ -34,6 +41,7 @@ The script checks this repo's `main` branch every 6 hours and installs new commi
 ## Security
 
 - **Where it runs:** the script runs as you, inside your Google account. The dashboard opens only for your Google login.
+- **Drive access:** `drive.file` only. Drive, Docs and Sheets are used through their REST APIs so the script never needs access to all your files.
 - **Secrets:** API keys live in the script's private user properties, never in Drive or this repo.
 - **Phone shortcuts and webhooks:** they use a random 32-character token, compared in constant time. It can be sent in the request body instead of the URL. Pocket webhook bodies are never trusted; every recording is re-fetched from Pocket's API.
 - **Untrusted content:** transcript text is treated as data. It is escaped in HTML and e-mail, kept from being read as a formula in Sheets, and marked as data, not instructions, in every AI prompt.
