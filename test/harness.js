@@ -233,6 +233,10 @@ const UrlFetchApp = {
       return resp(200, { content: [{ type: 'thinking', thinking: '' }, { type: 'text', text }], stop_reason: 'end_turn', usage: { input_tokens: 1000, output_tokens: 200 } });
     }
     if (u.host === 'api.github.com') {
+      const auth = (p.headers || {}).Authorization || '';
+      gh.lastAuth = auth;
+      if (gh.validToken && auth && auth !== 'Bearer ' + gh.validToken) return resp(401, { message: 'Bad credentials' });
+      if (gh.rateLimited && !auth) return resp(403, { message: 'API rate limit exceeded' }, { 'X-RateLimit-Reset': '1793300000' });
       if (/\/commits\/main$/.test(u.pathname)) return resp(200, gh.head);
       const cm = u.pathname.match(/\/contents\/([^/]+)$/);
       if (cm && u.searchParams.get('ref') === gh.head.sha) {
@@ -248,6 +252,7 @@ const UrlFetchApp = {
       const path = u.pathname.replace(/^\/v1\/projects\/[^/]+/, '');
       const m = (p.method || 'get').toLowerCase();
       scriptCalls.push(m + ' ' + path);
+      if (gh.apiOff === 'project') return resp(403, { error: { message: 'Apps Script API has not been used in project 259618256529 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/script.googleapis.com/overview?project=259618256529 then retry.', status: 'PERMISSION_DENIED' } });
       if (gh.apiOff) return resp(403, { error: { message: 'User has not enabled the Apps Script API.' } });
       if (path === '/content' && m === 'get') return resp(200, { files: JSON.parse(JSON.stringify(gh.files)) });
       if (path === '/content' && m === 'put') { gh.files = JSON.parse(p.payload).files; gh.puts.push(JSON.parse(JSON.stringify(gh.files))); return resp(200, {}); }

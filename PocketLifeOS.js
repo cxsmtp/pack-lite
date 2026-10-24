@@ -171,10 +171,15 @@ function doGet() {
   if (!isOwner_()) {
     return HtmlService.createHtmlOutput('<p style="font-family:sans-serif;padding:24px">This is a private dashboard.</p>');
   }
-  return HtmlService.createHtmlOutput(UI_HTML_())
-    .setTitle(APP_NAME)
+  const page = HtmlService.createHtmlOutput(UI_HTML_())
+    .setTitle('Life OS')   // the name a phone suggests for the home-screen icon
     .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+  // Opened from the home screen, these make it full screen like an app. Optional: never let them break the page.
+  try { page.addMetaTag('apple-mobile-web-app-capable', 'yes'); page.addMetaTag('mobile-web-app-capable', 'yes'); } catch (e) { /* not supported here */ }
+  try { page.setFaviconUrl(APP_ICON_URL); } catch (e) { /* keep the default icon */ }
+  return page;
 }
+const APP_ICON_URL = 'https://raw.githubusercontent.com/' + 'cxsmtp/pack-lite' + '/main/icon.png';
 
 /**
  * Webhook receiver (optional "instant sync"). Pocket → this URL?token=XXXX
@@ -336,6 +341,7 @@ function getCfg_() {
 function saveCfg_(cfg) { props_().setProperty('cfg', JSON.stringify(cfg)); }
 function getKey_() { return props_().getProperty('pocketKey') || ''; }
 function getAiKey_() { return props_().getProperty('anthropicKey') || ''; }
+function getGithubToken_() { return props_().getProperty('githubToken') || ''; }
 function getState_(k, dflt) { const v = props_().getProperty('st_' + k); return v == null ? dflt : JSON.parse(v); }
 function setState_(k, v) { props_().setProperty('st_' + k, JSON.stringify(v)); }
 
@@ -553,7 +559,9 @@ function gapi_(method, url, opt) {
     if (code >= 400) {
       let msg = 'HTTP ' + code;
       try { msg = JSON.parse(res.getContentText()).error.message || msg; } catch (e) { /* keep */ }
-      const err = new Error('Google ' + method.toUpperCase() + ' ' + url.split('?')[0].replace(/^https:\/\/[^/]+/, '') + ': ' + msg);
+      // Only the API name and Google's reason: no URLs, file ids or tokens end up in logs.
+      const api = /sheets\.googleapis/.test(url) ? 'Sheets' : /script\.googleapis/.test(url) ? 'Apps Script' : 'Drive';
+      const err = new Error('Google ' + api + ' request failed (HTTP ' + code + '): ' + msg);
       err.httpCode = code;
       throw err;
     }
@@ -1656,7 +1664,7 @@ function apiState_() {
     links: { dashboard: ScriptApp.getService().getUrl() || '' }, claudeInstructions: CLAUDE_INSTRUCTIONS_(),
     ai: { configured: !!getAiKey_(), usage: getState_('aiUsage', null), models: CLAUDE_MODELS },
     appRatings: getState_('appRatings', {}),
-    update: { repo: UPDATE_REPO, branch: UPDATE_BRANCH, installed: getState_('installedSha', ''), check: getState_('updateCheck', null), last: getState_('lastUpdate', null) }
+    update: { repo: UPDATE_REPO, branch: UPDATE_BRANCH, installed: getState_('installedSha', ''), check: getState_('updateCheck', null), last: getState_('lastUpdate', null), hasToken: !!getGithubToken_() }
   };
   const ctx = openWorkspace_(cfg);
   out.links.root = ctx.root.getUrl();
@@ -1702,6 +1710,12 @@ function apiSaveSettings_(args) {
   if (args.clearKey) props_().deleteProperty('pocketKey');
   if (args.aiKey) props_().setProperty('anthropicKey', String(args.aiKey).trim());
   if (args.clearAiKey) props_().deleteProperty('anthropicKey');
+  if (args.githubToken) {
+    const gt = String(args.githubToken).trim();
+    if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,255}$/.test(gt)) throw new Error('That does not look like a GitHub token (they start with github_pat_ or ghp_).');
+    props_().setProperty('githubToken', gt);
+  }
+  if (args.clearGithubToken) props_().deleteProperty('githubToken');
   if (CLAUDE_MODELS.indexOf(next.aiModel) < 0) next.aiModel = DEFAULT_CFG.aiModel;
   ['aiMaxAgeDays', 'weeklyHour'].forEach(function (k) { next[k] = Number(next[k]); });
   if (next.backfillFrom !== cur.backfillFrom) setState_('backfillDone', false);
@@ -2439,10 +2453,22 @@ function autoUpdate() {
 }
 
 function github_(path) {
-  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + UPDATE_REPO + path,
-    { muteHttpExceptions: true, headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' } });
-  if (res.getResponseCode() !== 200) throw new Error('GitHub ' + path + ' → HTTP ' + res.getResponseCode());
-  return JSON.parse(res.getContentText());
+  const token = getGithubToken_();
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'pocket-life-os' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = UrlFetchApp.fetch('https://api.github.com/repos/' + UPDATE_REPO + path, { muteHttpExceptions: true, headers: headers });
+  const code = res.getResponseCode();
+  if (code === 200) return JSON.parse(res.getContentText());
+  if (code === 401) throw new Error('GitHub did not accept the saved GitHub token. Replace or remove it in Settings → Updates.');
+  if (code === 403 || code === 429) {
+    // Without a token GitHub allows 60 requests an hour per IP address, and Apps Script shares its addresses with everyone.
+    const h = res.getAllHeaders() || {};
+    const reset = Number(h['X-RateLimit-Reset'] || h['x-ratelimit-reset'] || 0);
+    const when = reset ? ' Try again after ' + Utilities.formatDate(new Date(reset * 1000), getCfg_().timezone, 'HH:mm') + '.' : ' Try again later.';
+    throw new Error(token ? 'GitHub is limiting requests for this token.' + when
+      : 'GitHub limits update checks that come from Google\'s shared servers.' + when + ' To avoid this, add a read-only GitHub token in Settings → Updates.');
+  }
+  throw new Error('GitHub ' + path.split('?')[0] + ' → HTTP ' + code);
 }
 
 /** A file's text at an exact commit, through the GitHub API (not a CDN). */
@@ -2476,6 +2502,9 @@ function scriptApi_(method, path, body) {
   try { json = JSON.parse(res.getContentText() || '{}'); } catch (e) { json = {}; }
   if (code >= 400) {
     const msg = (json.error && json.error.message) || ('HTTP ' + code);
+    if (/has not been used in project|SERVICE_DISABLED/i.test(msg)) {
+      throw new Error('The Apps Script API is off in this script\'s Google Cloud project. Google hides the default project, so link the script to a standard Cloud project (README → "Turn on auto-update"), or set Install updates to Never and update by pasting.');
+    }
     if (/Apps Script API/i.test(msg) || code === 403) {
       throw new Error('Turn on "Google Apps Script API" at https://script.google.com/home/usersettings, then try again. (' + msg + ')');
     }
@@ -2657,7 +2686,7 @@ function UI_HTML_() {
   return `<title>Pocket Life OS</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Grand+Hotel&display=swap">
 <style>
 /* Layout: fixed left rail (nav + sync status) beside a scrolling workspace; on phones the rail becomes a top bar with a swipeable tab strip. */
 :root {
@@ -2718,11 +2747,12 @@ h3 { font-size: .98rem; }
 .small { font-size: .82rem; }
 .label { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; }
 
-.app { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100%; }
+.shell { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100%; }
 .rail { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 18px; padding: 22px 14px; border-right: 1px solid var(--line); background: var(--surface); }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
-.mark { width: 30px; height: 30px; border-radius: 8px; background: var(--ink); display: grid; place-items: center; flex: none; }
-.mark i { width: 10px; height: 10px; border-radius: 50%; background: var(--rec); box-shadow: 0 0 0 3px color-mix(in srgb, var(--rec) 30%, transparent); }
+.mark { width: 30px; height: 30px; border-radius: 9px; background: radial-gradient(circle at 30% 107%, #fdf497 0%, #fdf497 5%, #fd5949 45%, #d6249f 60%, #285aeb 90%); display: grid; place-items: center; flex: none; }
+.mark i { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff; display: grid; place-items: center; }
+.mark i::after { content: ""; width: 4px; height: 4px; border-radius: 50%; background: #fff; }
 .brand b { font-family: var(--font-display); font-size: 1.05rem; display: block; line-height: 1.1; }
 .brand span { font-size: .72rem; color: var(--faint); }
 nav.tabs { display: flex; flex-direction: column; gap: 2px; }
@@ -2878,7 +2908,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
 @media (max-width: 880px) {
-  .app { grid-template-columns: minmax(0, 1fr); }
+  .shell { grid-template-columns: minmax(0, 1fr); }
   body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--surface); }
   .rail { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; height: auto; flex-direction: column; gap: 10px; padding-block: 10px 0; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { padding: 0; }
@@ -2903,14 +2933,209 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   h1 { font-size: 1.35rem; }
 }
 .mobile-sync { display: none; align-items: center; gap: 8px; margin-left: auto; }
+.mhead, .bnav { display: none; }
+.iconbtn { position: relative; width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--line); background: var(--surface); display: grid; place-items: center; cursor: pointer; padding: 0; }
+.iconbtn svg { width: 19px; height: 19px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.iconbtn .dot { position: absolute; top: 2px; right: 2px; width: 9px; height: 9px; box-shadow: 0 0 0 2px var(--surface); }
+.iconbtn[disabled] svg { animation: rot 1s linear infinite; }
+.more-list { display: grid; gap: 2px; }
+.more-item { display: flex; align-items: center; gap: 14px; width: 100%; padding: 13px 6px; border: 0; border-bottom: 1px solid var(--line); background: none; text-align: left; cursor: pointer; color: var(--fg); font-weight: 500; font-size: 1rem; }
+.more-item:last-child { border-bottom: 0; }
+.more-item svg { width: 22px; height: 22px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; color: var(--muted); }
+.more-item small { display: block; font-weight: 400; color: var(--muted); font-size: .8rem; }
+.grab { width: 38px; height: 5px; border-radius: 3px; background: var(--line); margin: -6px auto 0; }
+.install-steps { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; counter-reset: s; }
+.install-steps li { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; align-items: center; counter-increment: s; font-size: .95rem; }
+.install-steps li::before { content: counter(s); width: 28px; height: 28px; border-radius: 50%; background: var(--sunk); display: grid; place-items: center; font-weight: 600; font-size: .85rem; }
+.kbd { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-weight: 600; white-space: nowrap; }
+.kbd svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.app-icon { width: 64px; height: 64px; border-radius: 16px; background: radial-gradient(circle at 30% 107%, #fdf497 0%, #fdf497 5%, #fd5949 45%, #d6249f 60%, #285aeb 90%); display: grid; place-items: center; box-shadow: 0 6px 18px rgba(214, 36, 159, .25); flex: none; }
+.app-icon i { width: 30px; height: 30px; border-radius: 50%; border: 3.5px solid #fff; display: grid; place-items: center; }
+.app-icon i::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #fff; }
+
+
+/* Phones: an app layout. Compact top bar with the section name, bottom tab bar, bigger touch targets. */
+@media (max-width: 720px) {
+  body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
+  .rail { padding-block: 8px; gap: 0; background: color-mix(in srgb, var(--surface) 90%, transparent); -webkit-backdrop-filter: saturate(1.4) blur(14px); backdrop-filter: saturate(1.4) blur(14px); }
+  nav.tabs, .brand-text { display: none; }
+  .mhead { display: block; min-width: 0; }
+  .mhead b { font-family: var(--font-display); font-size: 1.12rem; display: block; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mhead span { font-size: .74rem; color: var(--faint); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mobile-sync { display: flex !important; }
+  main { padding-block: 14px calc(88px + env(safe-area-inset-bottom, 0px)); padding-left: max(12px, env(safe-area-inset-left, 0px)); padding-right: max(12px, env(safe-area-inset-right, 0px)); }
+  .wrap { gap: 14px; }
+  .head h1 { font-size: 1.3rem; }
+  .head p { font-size: .88rem; }
+  .panel { border-radius: 14px; }
+  .panel-h { padding: 12px 14px; }
+  .panel-b { padding: 14px; }
+  .btn { min-height: 40px; }
+  .btn.sm { min-height: 34px; padding: 6px 12px; }
+  .seg { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .seg::-webkit-scrollbar { display: none; }
+  .seg button { padding: 9px 14px; white-space: nowrap; }
+  input, select, textarea { font-size: 16px !important; }
+  .bnav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+    padding: 4px max(4px, env(safe-area-inset-right, 0px)) calc(4px + env(safe-area-inset-bottom, 0px)) max(4px, env(safe-area-inset-left, 0px));
+    background: color-mix(in srgb, var(--surface) 92%, transparent); -webkit-backdrop-filter: saturate(1.4) blur(14px); backdrop-filter: saturate(1.4) blur(14px); border-top: 1px solid var(--line); }
+  .bnav button { position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px; min-height: 52px; padding: 6px 0 2px; border: 0; background: none; color: var(--faint); font-size: .68rem; font-weight: 500; cursor: pointer; }
+  .bnav svg { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .bnav button[aria-current="page"] { color: var(--fg); }
+  .bnav button[aria-current="page"] svg { stroke-width: 2.2; }
+  .bnav .badge { position: absolute; top: 2px; left: calc(50% + 5px); min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--rec); color: #fff; font: 600 .64rem/18px var(--font-mono); text-align: center; box-shadow: 0 0 0 2px var(--surface); }
+  .toast { left: max(12px, env(safe-area-inset-left, 0px)); right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(76px + env(safe-area-inset-bottom, 0px)); max-width: none; text-align: center; border-radius: 12px; }
+  .sheet { border-radius: 18px 18px 0 0; }
+}
+
+/* Instagram-style pieces: story ring row, feed avatars. */
+.stories { display: flex; gap: 14px; overflow-x: auto; scrollbar-width: none; padding: 2px 2px 4px; margin: -4px 0; scroll-snap-type: x proximity; }
+.stories::-webkit-scrollbar { display: none; }
+.story { flex: none; display: grid; justify-items: center; gap: 5px; width: 70px; border: 0; background: none; padding: 0; cursor: pointer; color: var(--fg); scroll-snap-align: start; }
+.ring { width: 66px; height: 66px; border-radius: 50%; padding: 2.5px; display: grid; place-items: center; background: var(--line); }
+.ring.Office { background: linear-gradient(45deg, #2f5bd3, #7b61ff); }
+.ring.Personal { background: linear-gradient(45deg, #13795b, #3cc9a0); }
+.ring.Unsorted, .ring.fresh { background: linear-gradient(45deg, #feda75, #fa7e1e, #d62976, #962fbf); }
+.ring.add { background: none; border: 1.5px dashed var(--faint); }
+.ring .av { width: 100%; height: 100%; border-radius: 50%; border: 3px solid var(--bg); background: var(--sunk); display: grid; place-items: center; font-weight: 600; font-size: 1.05rem; color: var(--fg); }
+.ring.add .av { border: 0; background: none; font-size: 1.6rem; font-weight: 400; color: var(--muted); }
+.story .nm { font-size: .72rem; max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.fav, .mwhen { display: none; }
+.wordmark { font-family: "Grand Hotel", "Bricolage Grotesque", cursive !important; font-weight: 400 !important; font-size: 1.75rem !important; letter-spacing: 0 !important; line-height: 1 !important; }
+.iconbtn.plain { border: 0; background: none; color: var(--fg); }
+.iconbtn .badge { position: absolute; top: 3px; right: 1px; min-width: 17px; height: 17px; padding: 0 4px; border-radius: 9px; background: var(--rec); color: #fff; font: 600 .62rem/17px var(--font-mono); text-align: center; box-shadow: 0 0 0 2px var(--surface); }
+.iconbtn[aria-current="page"] svg { fill: var(--rec); stroke: var(--rec); }
+.me { width: 27px; height: 27px; border-radius: 50%; background: var(--sunk); color: var(--fg); display: grid; place-items: center; font: 600 .66rem/1 var(--font-body); box-shadow: 0 0 0 1.5px var(--line); }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (max-width: 720px) {
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #ffffff; } }
+  :root[data-theme="light"] { --bg: #ffffff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --surface: #000000; --sunk: #1a1a1a; --line: #262626; } }
+  :root[data-theme="dark"] { --bg: #000000; --surface: #000000; --sunk: #1a1a1a; --line: #262626; }
+  .rail { border-bottom: 1px solid var(--line); }
+  .mobile-sync { gap: 2px; }
+  .wrap > * { animation: rise .22s ease-out both; }
+  .head p { display: none; }
+  body:not([data-page="home"]) .head > div:first-child { display: none; }
+  body:not([data-page="home"]) .head { margin-bottom: -6px; }
+  .row .meta > span:first-child { display: none; }
+  .seg { border: 0; background: none; gap: 8px; border-radius: 0; overflow: visible; }
+  .seg button { border: 0 !important; border-radius: 9px; background: var(--sunk); color: var(--fg); font-weight: 600; font-size: .85rem; padding: 7px 14px; }
+  .seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+  input[type="search"], input[type="text"], input[type="date"], select, textarea { border-radius: 10px; background: var(--sunk); border-color: transparent; }
+  .head .toolbar { width: 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .head .toolbar::-webkit-scrollbar { display: none; }
+  .head .toolbar .btn { border-radius: 9px; background: var(--sunk); border-color: transparent; font-weight: 600; font-size: .85rem; min-height: 34px; padding: 6px 14px; }
+  .head .toolbar .btn.primary { background: var(--office); color: #fff; }
+  .panel { border: 0; border-radius: 0; margin-inline: -12px; background: var(--surface); }
+  .panel + .panel, .grid2 > .panel + .panel { border-top: 8px solid var(--sunk); }
+  .grid2 { gap: 0; }
+  .panel-h { border-bottom: 0; padding: 14px 16px 6px; }
+  .panel-h h2 { font-size: 1rem; }
+  .row { grid-template-columns: 40px minmax(0, 1fr) !important; gap: 4px 12px; padding: 14px 16px; border-top: 0; }
+  .row .when { display: none; }
+  .row .fav { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; font-weight: 600; font-size: .85rem; grid-row: span 2; background: var(--sunk); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--line); }
+  .row .fav.Office { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--office); }
+  .row .fav.Personal { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--personal); }
+  .row .fav.Unsorted { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--unsorted); }
+  .row .mwhen { display: block; font-size: .8rem; font-weight: 600; color: var(--fg); }
+  .row .t { font-weight: 500; font-size: .95rem; margin-top: 1px; }
+  .row .s { font-size: .9rem; color: var(--fg); opacity: .82; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .row .side { grid-column: 2; flex-direction: row; align-items: center; gap: 12px; }
+  .row .links a { font-weight: 600; }
+  .todo { padding: 13px 16px; border-top: 0; }
+  .check { width: 22px; height: 22px; border-radius: 50%; }
+  .stats { border: 0; border-radius: 0; margin-inline: -12px; gap: 0; background: none; grid-template-columns: repeat(4, minmax(0, 1fr)) !important; text-align: center; }
+  .stat { padding: 6px 4px; background: none; justify-items: center; }
+  .stat .label { order: 2; text-transform: none; letter-spacing: 0; font-size: .74rem; color: var(--muted); font-weight: 400; }
+  .stat b { font-size: 1.15rem; }
+  .stat .small, .stat .split { display: none; }
+  .banner { border-radius: 12px; }
+  button:active, .btn:active, .story:active, .bnav button:active { transform: scale(.94); transition: transform .08s; }
+  .bnav { grid-template-columns: repeat(5, minmax(0, 1fr)); padding-top: 2px; }
+  .bnav button { min-height: 50px; justify-content: center; color: var(--fg); }
+  .bnav svg { width: 27px; height: 27px; stroke-width: 1.8; }
+  .bnav button[aria-current="page"] svg { stroke-width: 2.6; }
+  .bnav button[aria-current="page"] .me { box-shadow: 0 0 0 2px var(--fg); }
+}
+
+/* Phone polish: native type, quiet colour, the gradient kept for the rings. */
+.acts { display: none; }
+.ring .av, .fav { --h: 220; }
+.ring .av { background: hsl(var(--h) 65% 90%); color: hsl(var(--h) 40% 30%); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .ring .av { background: hsl(var(--h) 28% 20%); color: hsl(var(--h) 70% 80%); } }
+:root[data-theme="dark"] .ring .av { background: hsl(var(--h) 28% 20%); color: hsl(var(--h) 70% 80%); }
+@media (max-width: 720px) {
+  :root { --font-body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; --ig-blue: #0095f6; --ig-gray: #efefef; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ig-gray: #262626; --fg: #f5f5f5; --muted: #a8a8a8; --faint: #737373; } }
+  :root[data-theme="dark"] { --ig-gray: #262626; --fg: #f5f5f5; --muted: #a8a8a8; --faint: #737373; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --fg: #000000; --muted: #737373; --faint: #a8a8a8; --line: #dbdbdb; --sunk: #efefef; } }
+  :root[data-theme="light"] { --fg: #000000; --muted: #737373; --faint: #a8a8a8; --line: #dbdbdb; --sunk: #efefef; }
+  body { font-size: 15px; letter-spacing: -.005em; }
+  h1, h2, h3 { letter-spacing: -.02em; }
+  .mono { font-family: var(--font-body); }
+  .rail .mark { display: none; }
+  .wordmark { font-size: 1.95rem !important; }
+  .mhead b:not(.wordmark) { font-size: 1.2rem; font-weight: 700; }
+  .rail { border-bottom-color: color-mix(in srgb, var(--line) 70%, transparent); }
+  .bnav { border-top-color: color-mix(in srgb, var(--line) 70%, transparent); }
+  .banner { border: 0; background: var(--ig-gray); font-size: .84rem; padding: 10px 14px; }
+  .banner .faint { display: none; }
+  .btn { border-radius: 8px; font-weight: 600; border-color: transparent; background: var(--ig-gray); }
+  .btn.primary { background: var(--ig-blue); border-color: var(--ig-blue); color: #fff; }
+  .head .toolbar .btn { background: var(--ig-gray); color: var(--fg); }
+  .head .toolbar .btn.primary, .head .toolbar [data-act="sync"] { display: none; }
+  .ring { width: 68px; height: 68px; padding: 2.5px; background: #dbdbdb; }
+  .ring.fresh { background: radial-gradient(circle at 30% 107%, #fdf497 0%, #fdf497 5%, #fd5949 45%, #d6249f 60%, #285aeb 90%); }
+  .ring.add { background: none; border: 0; }
+  .ring.add .av { background: var(--ig-gray); color: var(--fg); font-size: 1.7rem; font-weight: 300; }
+  .ring .av { background: hsl(var(--h) 65% 90%); color: hsl(var(--h) 40% 30%); font-weight: 600; font-size: 1.1rem; letter-spacing: .02em; border-color: var(--surface); }
+  .story .nm { color: var(--fg); font-size: .74rem; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .ring .av, :root:not([data-theme="light"]) .row .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); } }
+  :root[data-theme="dark"] .ring .av, :root[data-theme="dark"] .row .fav { background: hsl(var(--h) 28% 20%) !important; color: hsl(var(--h) 70% 80%); }
+  .row .fav { background: hsl(var(--h) 65% 90%) !important; color: hsl(var(--h) 40% 30%); box-shadow: none !important; width: 38px; height: 38px; font-size: .82rem; }
+  .row .mwhen { font-weight: 400; color: var(--muted); font-size: .84rem; }
+  .row .mwhen b { color: var(--fg); font-weight: 600; }
+  .row .mwhen span { color: var(--muted); }
+  .row .t { font-weight: 600; font-size: .98rem; line-height: 1.3; margin-top: 2px; }
+  .row .s { opacity: 1; color: var(--fg); font-size: .92rem; line-height: 1.42; margin-top: 4px; }
+  .row .meta { color: var(--muted); font-size: .8rem; }
+  .row .side { display: block; }
+  .row .side > .chip, .row .links { display: none; }
+  .row .acts { display: flex; align-items: center; gap: 18px; margin-top: 8px; }
+  .row .acts a, .row .acts button { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; background: none; color: var(--fg); cursor: pointer; }
+  .row .acts svg { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .row .acts .chip { margin-left: auto; }
+  .chip { background: none !important; padding: 0; font-weight: 500; color: var(--muted) !important; font-size: .78rem; }
+  .chip.Office::before { background: var(--office); }
+  .chip.Personal::before { background: var(--personal); }
+  .chip.Unsorted::before { background: var(--unsorted); }
+  .todo { grid-template-columns: 24px minmax(0, 1fr) auto; }
+  .todo .t { font-weight: 500; }
+  .todo .meta { color: var(--muted); }
+  .todo .meta a { color: var(--muted); }
+  .todo .cdate, .todo .intasks { display: none; }
+  .check { width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid var(--faint); margin-top: 0; }
+  .check.done { background: var(--fg); border-color: var(--fg); }
+  .check.done::after { border-color: var(--bg); }
+  .due { font-family: var(--font-body); font-size: .82rem; color: var(--muted); }
+  .due.late { color: #ed4956; font-weight: 600; }
+  .group-h { background: none; border-top: 0 !important; padding: 18px 16px 4px; font-size: 1rem !important; font-weight: 700; color: var(--fg) !important; text-transform: none !important; letter-spacing: -.01em !important; }
+  .step .n { border-color: var(--line); }
+  .step.ok .n { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+  .panel + .panel, .grid2 > .panel + .panel { border-top: 1px solid var(--line); }
+  a { color: var(--fg); }
+  .toast { background: #262626; color: #fff; }
+}
 </style>
 
-<div class="app">
+<div class="shell">
   <aside class="rail">
     <div class="brand">
       <div class="mark" aria-hidden="true"><i></i></div>
-      <div><b>Life OS</b><span>Pocket conversations</span></div>
-      <div class="mobile-sync"><span class="dot" id="mdot"></span><button class="btn sm" id="msync" type="button">Sync</button></div>
+      <div class="brand-text"><b>Life OS</b><span>Pocket conversations</span></div>
+      <div class="mhead"><b id="mtitle">Life OS</b><span id="msub" hidden></span></div>
+      <div class="mobile-sync"><button class="iconbtn plain" type="button" data-view="review" aria-label="Review" id="mreview"><svg viewBox="0 0 24 24"><path d="M12 20.5s-7.5-4.6-9.3-9.2C1.5 8.1 3.6 4.5 7.1 4.5c2 0 3.6 1.1 4.9 2.8 1.3-1.7 2.9-2.8 4.9-2.8 3.5 0 5.6 3.6 4.4 6.8-1.8 4.6-9.3 9.2-9.3 9.2z"/></svg><span class="badge" id="mbadge" hidden></span></button><button class="iconbtn plain" id="msync" type="button" aria-label="Sync now"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2"/><path d="M21 4v5h-5M3 20v-5h5"/></svg><span class="dot" id="mdot"></span></button></div>
     </div>
     <nav class="tabs" id="tabs" aria-label="Sections"></nav>
     <div class="syncbox">
@@ -2921,6 +3146,8 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   </aside>
   <main><div class="wrap" id="view"></div></main>
 </div>
+<nav class="bnav" id="bnav" aria-label="Sections"></nav>
+<div class="sheet-bg" id="morebg" hidden><div class="sheet" role="dialog" aria-modal="true" aria-label="More" id="moresheet"></div></div>
 <div class="toast" id="toast" hidden></div>
 <input type="file" id="upfile" multiple accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.aac,.ogg,.opus,.flac,.webm,.srt,.vtt,.txt,.md" hidden>
 <div class="sheet-bg" id="sheetbg" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheettitle" id="sheet"></div></div>
@@ -2996,9 +3223,96 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   }
 
   /* ---------- shell ---------- */
+  var BOTTOM = [['home', 'Home'], ['talks', 'Conversations'], ['+', 'Upload'], ['todos', 'To-dos']];
+  var PLUS = '<rect x="3" y="3" width="18" height="18" rx="5.5"/><path d="M12 8v8M8 12h8"/>';
+  var MORE = [['ask', 'Ask', 'Search by meaning across every conversation'], ['people', 'People', 'Who is Office and who is Personal'], ['settings', 'Settings', 'Pocket key, sync, uploads, updates'], ['playbook', 'Playbook', 'How it works and how to connect Claude']];
+  var DOTS = '<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>';
+  var PHONE = '<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M11 18h2"/>';
+  var UPLOAD = '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v4h16v-4"/>';
+  function renderBottom(review) {
+    var inMore = MORE.some(function (m) { return m[0] === S.view; });
+    var me = S.state && S.state.account && (S.state.account.displayName || S.state.account.email) || 'Me';
+    $('#bnav').innerHTML = BOTTOM.map(function (t) {
+      if (t[0] === '+') return '<button type="button" data-act="upload" aria-label="Upload audio or transcripts"><svg viewBox="0 0 24 24">' + PLUS + '</svg></button>';
+      return '<button type="button" data-view="' + t[0] + '" aria-label="' + t[1] + '"' + (S.view === t[0] ? ' aria-current="page"' : '') + '><svg viewBox="0 0 24 24">' + ICONS[t[0]] + '</svg></button>';
+    }).join('') + '<button type="button" data-act="more" aria-label="More"' + (inMore ? ' aria-current="page"' : '') + '><span class="me">' + esc(initials(me)) + '</span></button>';
+    var cur = TABS.filter(function (t) { return t[0] === S.view; })[0];
+    $('#mtitle').textContent = S.view === 'home' || !cur ? 'Life OS' : cur[1];
+    $('#mtitle').className = S.view === 'home' ? 'wordmark' : '';
+    var mb = $('#mbadge'); mb.hidden = !review; mb.textContent = review > 99 ? '99+' : review;
+    var mr = $('#mreview'); if (S.view === 'review') mr.setAttribute('aria-current', 'page'); else mr.removeAttribute('aria-current');
+  }
+  function openMore() {
+    $('#moresheet').innerHTML = '<div class="grab"></div><div class="more-list">' + MORE.map(function (m) {
+      return '<button class="more-item" type="button" data-view="' + m[0] + '"><svg viewBox="0 0 24 24">' + ICONS[m[0]] + '</svg><span>' + m[1] + '<small>' + m[2] + '</small></span></button>';
+    }).join('') +
+      '<button class="more-item" type="button" data-act="upload"><svg viewBox="0 0 24 24">' + UPLOAD + '</svg><span>Upload audio or transcripts<small>Voice memos, Zoom exports, files from the Pocket</small></span></button>' +
+      '<button class="more-item" type="button" data-act="install"><svg viewBox="0 0 24 24">' + PHONE + '</svg><span>Add to Home Screen<small>Open Life OS like an app</small></span></button></div>';
+    $('#morebg').hidden = false;
+  }
+  function hue(name) { var h = 0; String(name || '').split('').forEach(function (ch) { h = (h * 31 + ch.charCodeAt(0)) % 360; }); return h; }
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function nice(ymd) {
+    if (!ymd) return '';
+    var t = today(), d = new Date(ymd + 'T12:00:00'), n = new Date(t + 'T12:00:00');
+    var diff = Math.round((d - n) / 864e5);
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Tomorrow';
+    if (diff === -1) return 'Yesterday';
+    return MONTHS[d.getMonth()] + ' ' + d.getDate() + (d.getFullYear() !== n.getFullYear() ? ', ' + d.getFullYear() : '');
+  }
+  function initials(name) {
+    var parts = String(name || '?').replace(/[^\\p{L}\\p{N} ]/gu, ' ').trim().split(/\\s+/).filter(Boolean);
+    return ((parts[0] || '?').charAt(0) + (parts.length > 1 ? parts[parts.length - 1].charAt(0) : '')).toUpperCase();
+  }
+  /* Instagram-style row of the people you talked with most recently. Tap one to see your conversations with them. */
+  function storiesRow(recent) {
+    var seen = {}, people = [];
+    (recent || []).forEach(function (c) {
+      String(c.people || '').split(/,\\s*/).forEach(function (p) {
+        p = p.trim(); if (!p || seen[p.toLowerCase()]) return;
+        seen[p.toLowerCase()] = 1; people.push({ name: p, cat: c.category, fresh: (new Date(today()) - new Date(c.date)) / 864e5 <= 1 });
+      });
+    });
+    if (!people.length) return '';
+    return '<div class="stories" role="list">' +
+      '<button class="story" type="button" data-act="upload" role="listitem"><span class="ring add"><span class="av">+</span></span><span class="nm">Upload</span></button>' +
+      people.slice(0, 15).map(function (p) {
+        return '<button class="story" type="button" data-person-q="' + esc(p.name) + '" role="listitem"><span class="ring' + (p.fresh ? ' fresh' : '') + '"><span class="av" style="--h:' + hue(p.name) + '">' + esc(initials(p.name)) + '</span></span><span class="nm">' + esc(p.name.split(' ')[0]) + '</span></button>';
+      }).join('') + '</div>';
+  }
+  function closeSheets() { $('#morebg').hidden = true; }
+
+  /* Browsers only offer a real install prompt to sites with their own domain; Apps Script pages can't, so this explains the two taps instead. */
+  var INSTALL_KEY = 'lifeos.install';
+  function isPhone() { return window.matchMedia && matchMedia('(max-width: 720px)').matches && ('ontouchstart' in window || navigator.maxTouchPoints > 0); }
+  function isIOS() { return /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+  function openInstall() {
+    var ios = isIOS();
+    var share = '<span class="kbd"><svg viewBox="0 0 24 24"><path d="M12 15V3M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>Share</span>';
+    var menu = '<span class="kbd"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/></svg>menu</span>';
+    $('#moresheet').innerHTML = '<div class="grab"></div>' +
+      '<div class="inline" style="gap:14px;align-items:center"><div class="app-icon" aria-hidden="true"><i></i></div><div><h2>Add Life OS to your Home Screen</h2><p class="small muted" style="margin:2px 0 0">One tap from your home screen, full screen, no browser bars.</p></div></div>' +
+      '<ol class="install-steps">' + (ios
+        ? '<li><span>Tap ' + share + ' in Safari’s toolbar (bottom of the screen, or top on iPad).</span></li><li><span>Scroll down and tap <span class="kbd">Add to Home Screen</span>.</span></li><li><span>Name it <b>Life OS</b> and tap <span class="kbd">Add</span>.</span></li>'
+        : '<li><span>Tap Chrome’s ' + menu + ' at the top right.</span></li><li><span>Tap <span class="kbd">Add to Home screen</span> (or <span class="kbd">Install app</span>).</span></li><li><span>Name it <b>Life OS</b> and tap <span class="kbd">Add</span>.</span></li>') +
+      '</ol><p class="small faint" style="margin:0">If the page asks you to sign in after opening from the home screen, sign in with the same Google account once.</p>' +
+      '<div class="inline"><button class="btn primary" type="button" data-act="install-done">I’ve added it</button><button class="btn" type="button" data-act="install-later">Not now</button></div>';
+    $('#morebg').hidden = false;
+  }
+  function installSeen(v) { try { if (v !== undefined) localStorage.setItem(INSTALL_KEY, v); return localStorage.getItem(INSTALL_KEY) || ''; } catch (e) { return 'unavailable'; } }
+  function maybeAskInstall() {
+    if (!isPhone()) return;
+    var seen = installSeen();
+    if (seen === 'done' || seen === 'unavailable') return;
+    if (seen && Date.now() - Number(seen) < 3 * 864e5) return;
+    setTimeout(function () { if ($('#morebg').hidden && $('#sheetbg').hidden) openInstall(); }, 1200);
+  }
+
   function renderTabs() {
     var st = S.state || {};
     var review = st.stats ? (st.stats.unsorted + st.stats.unknownPeople) : 0;
+    renderBottom(review);
     $('#tabs').innerHTML = TABS.map(function (t) {
       var count = t[0] === 'review' && review ? '<span class="count">' + review + '</span>' : '';
       return '<button class="tab" type="button" data-view="' + t[0] + '"' + (S.view === t[0] ? ' aria-current="page"' : '') + '><svg viewBox="0 0 24 24">' + ICONS[t[0]] + '</svg>' + t[1] + count + '</button>';
@@ -3012,9 +3326,12 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     $('#sline').textContent = !st.configured ? 'Not connected yet' : (ls ? (ls.ok === false ? 'Last sync failed' : 'Synced ' + ago(ls.at)) : 'Waiting for first sync');
     var every = st.cfg ? st.cfg.syncEveryMinutes : 15;
     $('#snext').textContent = st.configured ? (ls && ls.message ? ls.message : 'Runs every ' + every + ' min in Google’s cloud') : 'Add your Pocket key in Settings';
+    $('#msub').textContent = $('#sline').textContent;
   }
   function go(view) {
     S.view = view;
+    document.body.setAttribute('data-page', view);
+    closeSheets();
     try { history.replaceState(null, '', '#' + view); } catch (e) { /* sandboxed */ }
     renderTabs();
     var v = $('#view');
@@ -3028,12 +3345,14 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   function doSync(btn) {
     if (!S.state || !S.state.configured) { toast('Add your Pocket API key in Settings first.'); go('settings'); return; }
     var b2 = btn || $('#syncbtn');
-    busy(b2, true, 'Syncing…'); $('#sdot').className = 'dot busy'; $('#mdot').className = 'dot busy';
+    if (b2.id === 'msync') { b2.disabled = true; $('#msub').textContent = 'Syncing…'; } else busy(b2, true, 'Syncing…');
+    $('#sdot').className = 'dot busy'; $('#mdot').className = 'dot busy';
+    var done = function () { if (b2.id === 'msync') b2.disabled = false; else busy(b2, false); };
     call('sync').then(function (r) {
-      busy(b2, false);
+      done();
       toast(r.message || 'Sync finished', 5000);
       return refreshState().then(function () { go(S.view); });
-    }).catch(function (e) { busy(b2, false); renderSync(); fail(e); });
+    }).catch(function (e) { done(); renderSync(); fail(e); });
   }
 
   function demoBanner() {
@@ -3045,12 +3364,17 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   /* ---------- rows ---------- */
   function convRow(c, expandable) {
     var people = c.people ? '<span>with ' + esc(c.people) + '</span>' : '<span>no named speakers</span>';
+    var first = String(c.people || '').split(',')[0].trim();
     var html = '<div class="row' + (expandable ? ' click' : '') + '" data-conv="' + esc(c.id) + '">' +
       '<div class="when"><b>' + esc(c.time) + '</b><span>' + esc(dayLabel(c.date)) + '</span></div>' +
-      '<div><div class="t">' + esc(c.title) + '</div>' +
+      '<span class="fav" style="--h:' + hue(first || c.title) + '" aria-hidden="true">' + esc(first ? initials(first) : '·') + '</span>' +
+      '<div><div class="mwhen"><b>' + esc(first || 'No named speakers') + '</b>' + (String(c.people || '').indexOf(',') > 0 ? ' and others' : '') + ' <span>· ' + esc(nice(c.date)) + ', ' + esc(c.time) + '</span></div><div class="t">' + esc(c.title) + '</div>' +
       (c.summary ? '<div class="s">' + esc(c.summary.length > 180 ? c.summary.slice(0, 178) + '…' : c.summary) + '</div>' : '') +
       '<div class="meta">' + people + '<span class="mono">' + esc(c.durationMin) + ' min</span>' + (gapText(c) ? '<span class="gap">transcript incomplete</span>' : '') + (c.source === 'imported' ? '<span class="srcchip">imported</span>' : '') + (c.todoCount ? '<span>' + c.todoCount + ' to-do' + (c.todoCount > 1 ? 's' : '') + '</span>' : '') + (c.tags ? '<span>#' + esc(c.tags.split(', ').join(' #')) + '</span>' : '') + '</div></div>' +
-      '<div class="side">' + chip(c.category) + '<div class="links">' + (c.docUrl ? '<a href="' + esc(c.docUrl) + '" target="_blank" rel="noopener">Doc</a>' : '') + (c.audioUrl ? '<a href="' + esc(c.audioUrl) + '" target="_blank" rel="noopener">Audio</a>' : '') + '</div></div>';
+      '<div class="side">' + chip(c.category) + '<div class="links">' + (c.docUrl ? '<a href="' + esc(c.docUrl) + '" target="_blank" rel="noopener">Doc</a>' : '') + (c.audioUrl ? '<a href="' + esc(c.audioUrl) + '" target="_blank" rel="noopener">Audio</a>' : '') + '</div>' +
+      '<div class="acts">' + (c.docUrl ? '<a href="' + esc(c.docUrl) + '" target="_blank" rel="noopener" aria-label="Open the doc"><svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></a>' : '') +
+      (c.audioUrl ? '<a href="' + esc(c.audioUrl) + '" target="_blank" rel="noopener" aria-label="Play the audio"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l6-3.5z"/></svg></a>' : '') +
+      '<button type="button" data-send="' + esc(c.id) + '" data-title="' + esc(c.title) + '" aria-label="Send to ' + esc(appLabel(prefApp())) + '"><svg viewBox="0 0 24 24"><path d="M21.5 3 10 14.5M21.5 3 15 21l-5-6.5L3 10z"/></svg></button>' + chip(c.category) + '</div></div>';
     if (expandable && S.open[c.id]) {
       html += '<div class="detail"><div class="small muted">Filed as <b>' + esc(c.category) + '</b> by ' + esc(c.categorySource || 'auto') + ' · ' + esc(c.date) + ' ' + esc(c.time) + '–' + esc(c.endTime || '') + '</div>' +
         (c.summary ? '<div>' + esc(c.summary) + '</div>' : '') +
@@ -3067,9 +3391,9 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     var late = t.status === 'open' && t.due && t.due < today();
     return '<div class="todo' + (t.status === 'done' ? ' done' : '') + '">' +
       '<button class="check' + (t.status === 'done' ? ' done' : '') + '" type="button" aria-label="' + (t.status === 'done' ? 'Reopen' : 'Mark done') + '" data-todo="' + esc(t.key) + '" data-done="' + (t.status === 'done' ? '1' : '') + '"></button>' +
-      '<div><div class="t">' + esc(t.title) + '</div><div class="meta">' + chip(t.category) + (t.docUrl ? '<a href="' + esc(t.docUrl) + '" target="_blank" rel="noopener">' + esc(t.conversation) + '</a>' : '<span>' + esc(t.conversation) + '</span>') + '<span class="mono">' + esc(t.conversationDate) + '</span>' +
-      (t.source === 'Claude' ? '<span class="srcchip">you promised</span>' : t.source === 'phone' ? '<span class="srcchip">from phone</span>' : '') + (t.inTasks ? '<span>in Google Tasks</span>' : '') + (t.priority ? '<span>' + esc(t.priority.toLowerCase()) + '</span>' : '') + '</div></div>' +
-      '<div class="due' + (late ? ' late' : '') + '">' + (t.due ? (late ? 'overdue ' : '') + esc(t.due) : '—') + '</div></div>';
+      '<div><div class="t">' + esc(t.title) + '</div><div class="meta">' + chip(t.category) + (t.docUrl ? '<a href="' + esc(t.docUrl) + '" target="_blank" rel="noopener">' + esc(t.conversation) + '</a>' : '<span>' + esc(t.conversation) + '</span>') + '<span class="mono cdate">' + esc(t.conversationDate) + '</span>' +
+      (t.source === 'Claude' ? '<span class="srcchip">you promised</span>' : t.source === 'phone' ? '<span class="srcchip">from phone</span>' : '') + (t.inTasks ? '<span class="intasks">in Google Tasks</span>' : '') + (t.priority ? '<span>' + esc(t.priority.toLowerCase()) + '</span>' : '') + '</div></div>' +
+      '<div class="due' + (late ? ' late' : '') + '" title="' + esc(t.due || '') + '">' + (t.due ? esc(nice(t.due)) : '—') + '</div></div>';
   }
 
   /* ---------- send to a chat app (no API key) ---------- */
@@ -3181,7 +3505,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     ];
     var setupDone = steps.filter(function (x) { return x[2]; }).length;
     var total = (s.office || 0) + (s.personal || 0) + (s.unsorted || 0) || 1;
-    var html = demoBanner() +
+    var html = demoBanner() + '<!--stories-->' +
       '<div class="head"><div><h1>' + greeting() + '</h1><p>' + (st.configured || demo ? 'Every Pocket conversation, filed by date and by who you were with.' : 'Five short steps and your conversations start filing themselves.') + '</p></div>' +
       '<div class="toolbar">' + (hasGAS && !demo && !st.configured ? '<button class="btn" type="button" data-act="enter-demo">Try with sample data</button>' : '') + (st.links && st.links.root ? '<a class="btn" href="' + esc(st.links.root) + '" target="_blank" rel="noopener">Open Drive folder</a>' : '') + '<button class="btn" type="button" data-send="" data-kind="week" data-title="This week">Weekly review in ' + esc(appLabel(prefApp())) + '</button><button class="btn primary" type="button" data-act="sync">Sync now</button></div></div>';
     if (setupDone < steps.length) {
@@ -3203,6 +3527,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       '<div class="panel-h" style="border-top:1px solid var(--line);border-bottom:0"><h3>Your archive</h3></div><div class="panel-b" style="padding-top:0"><div class="btns">' +
       (st.links && st.links.root ? '<a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.root) + '">Drive folder</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.sheet) + '">Index sheet</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.memory) + '">Claude memory</a>' + '<button class="btn sm primary" type="button" data-act="upload">Upload audio or transcripts</button>' : '') +
       '<a class="btn sm" target="_blank" rel="noopener" href="https://tasks.google.com/">Google Tasks</a></div></div></section></div>';
+    html = html.replace('<!--stories-->', storiesRow(st.recent));
     if ((st.log || []).length) {
       html += '<section class="panel"><div class="panel-h"><h2>Activity</h2></div><div class="tbl"><table><tbody>' + st.log.slice(0, 8).map(function (l) {
         return '<tr><td class="mono faint" style="white-space:nowrap">' + esc(ago(l.time)) + '</td><td>' + (l.level === 'error' ? '<span style="color:var(--danger)">error</span> ' : l.level === 'warn' ? '<span style="color:var(--unsorted)">warning</span> ' : '') + esc(l.message) + '</td></tr>';
@@ -3460,7 +3785,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
         autoUpdate: $('#autoUpdate').value, requireVerifiedCommits: $('#requireVerifiedCommits').checked
       };
       if ($$('[data-fmap]').length) cfg.folderMap = map;
-      call('saveSettings', { cfg: cfg, apiKey: $('#key').value.trim() || undefined, aiKey: $('#aikey').value.trim() || undefined }).then(function (st2) {
+      call('saveSettings', { cfg: cfg, apiKey: $('#key').value.trim() || undefined, aiKey: $('#aikey').value.trim() || undefined, githubToken: ($('#ghtoken') && $('#ghtoken').value.trim()) || undefined }).then(function (st2) {
         busy(b, false); S.state = st2; renderTabs(); renderSync(); toast('Settings saved'); go('settings');
       }).catch(function (e) { busy(b, false); fail(e); });
     });
@@ -3611,10 +3936,16 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       field('Install updates', sel('autoUpdate', c.autoUpdate, [['auto', 'Automatically (checks every 6 hours)'], ['ask', 'Ask me first'], ['off', 'Never']]),
         'Source: github.com/' + esc(u.repo) + ', branch ' + esc(u.branch) + '. Running ' + esc(short(u.installed)) + '. ' + esc(status) + (u.last ? ' · Last update ' + esc(ago(u.last.at)) : '')) +
       field('Safety', tog('requireVerifiedCommits', c.requireVerifiedCommits, 'Only install commits that GitHub shows as signed and verified'),
-        'Every update keeps a backup of the old code in Drive (_Life OS system / Code backups) and e-mails you. One-time setup: turn on “Google Apps Script API” at script.google.com/home/usersettings.') +
+        'Every update keeps a backup of the old code in Drive (_Life OS system / Code backups) and e-mails you. One-time setup: see “Turn on auto-update” in the README.') +
+      field('GitHub token', '<div class="inline"><input type="password" id="ghtoken" class="grow" placeholder="' + (u.hasToken ? 'saved, paste to replace' : 'optional: github_pat_…') + '" autocomplete="off">' + (u.hasToken ? '<button class="btn sm" type="button" id="ghclear">Remove</button>' : '') + '</div>',
+        'Optional. GitHub allows only a few anonymous checks an hour from Google\\'s shared servers. A fine-grained token with “Public repositories (read-only)” and no other permissions removes that limit. It cannot change anything on GitHub.') +
       field('Now', '<div class="inline"><button class="btn sm" type="button" id="updcheck">Check now</button><button class="btn sm" type="button" id="updinstall">Install latest</button><button class="btn sm" type="button" id="updrollback">Roll back</button></div><div id="updres" class="small"></div>') +
       '</div></section>';
   }
+  document.addEventListener('click', function (e) {
+    if (!e.target || e.target.id !== 'ghclear') return;
+    call('saveSettings', { clearGithubToken: true }).then(function (st2) { S.state = st2; toast('GitHub token removed'); go('settings'); }).catch(fail);
+  });
   function runUpdate(b, install) {
     busy(b, true, install ? 'Installing…' : 'Checking…');
     call('checkUpdate', { install: install }).then(function (r) {
@@ -3696,6 +4027,8 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     var t = e.target;
     var tab = t.closest('[data-view]');
     if (tab) { go(tab.getAttribute('data-view')); return; }
+    var pq = t.closest('[data-person-q]');
+    if (pq) { S.convFilter = { category: 'All', q: pq.getAttribute('data-person-q'), from: '', to: '' }; go('talks'); return; }
     var g = t.closest('[data-go]');
     if (g) { var to = g.getAttribute('data-go'); if (to === 'sync') doSync(g); else go(to); return; }
     var snd = t.closest('[data-send]');
@@ -3707,13 +4040,18 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       return;
     }
     if (t.id === 'sheetbg') { closeSend(); return; }
+    if (t.id === 'morebg') { closeSheets(); return; }
     var cp = t.closest('[data-copy]');
     if (cp) { copyText(cp.getAttribute('data-copy'), cp); return; }
     var act = t.closest('[data-act]');
     if (act) {
       var a = act.getAttribute('data-act');
       if (a === 'sync') doSync(act);
-      if (a === 'upload') { $('#upfile').click(); }
+      if (a === 'upload') { closeSheets(); $('#upfile').click(); }
+      if (a === 'more') openMore();
+      if (a === 'install') openInstall();
+      if (a === 'install-done') { installSeen('done'); closeSheets(); toast('Open Life OS from your home screen from now on.'); }
+      if (a === 'install-later') { installSeen(String(Date.now())); closeSheets(); }
       if (a === 'exit-demo') { demo = false; refreshState().then(function () { go('home'); }); }
       if (a === 'enter-demo') { demo = true; refreshState().then(function () { go('home'); }); }
       return;
@@ -3942,6 +4280,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   refreshState().then(function (st) {
     if (!demo && !st.configured && S.view === 'home') { /* setup checklist shows on Home */ }
     go(S.view);
+    maybeAskInstall();
   }).catch(function (e) {
     $('#view').innerHTML = errorBox(e) + (hasGAS ? '<div class="inline"><button class="btn" type="button" data-act="enter-demo">Explore with sample data</button></div>' : '');
   });
