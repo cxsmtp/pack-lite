@@ -277,3 +277,22 @@ ok(/conversations today/.test(A.doPost({ parameter: {}, postData: { contents: JS
 ok(A.doPost({ parameter: {}, postData: { contents: JSON.stringify({ token: tk2.slice(0, -1) + 'x', action: 'status' }) } }) === 'forbidden', 'near-miss token rejected');
 ok(A.doPost({ parameter: {}, postData: { contents: '{}' } }) === 'forbidden', 'missing token rejected');
 console.log('\nALL V4 PASSED');
+
+console.log('\n--- v5: input validation on the phone/webhook endpoint ---');
+const tk5 = JSON.parse(H.store.cfg).webhookToken;
+const post5 = (b) => A.doPost({ parameter: {}, postData: { contents: JSON.stringify(Object.assign({ token: tk5 }, b)) } });
+ok(/Unknown action/.test(post5({ action: 'deleteEverything' })), 'unknown action rejected');
+const r5a = post5({ action: 'todo', text: 'Pay rent\u0007\u0000', due: '2026-02-31', category: '=HYPERLINK("x")' });
+const t5 = A.api('todos', { status: 'all' }).find(t => /^Pay rent/.test(t.title));
+ok(t5 && t5.title === 'Pay rent' && t5.category === 'Unsorted' && t5.due !== '2026-02-31', 'control chars stripped, bad category/date replaced: ' + JSON.stringify(t5 && [t5.title, t5.category, t5.due]));
+post5({ action: 'todo', text: 'x'.repeat(5000), due: '2026-11-02', category: 'Office' });
+const t5b = A.api('todos', { status: 'all' }).find(t => /^xxx/.test(t.title));
+ok(t5b.title.length === 500 && t5b.due === '2026-11-02' && t5b.category === 'Office', 'long text capped, valid date/category kept');
+ok(/Say what/.test(post5({ action: 'todo', text: { evil: 1 } })), 'non-string text rejected');
+const qBefore = JSON.stringify(H.store.st_webhookQueue || '[]');
+post5({ event: 'summary.completed', recording: { id: '../../etc' } });
+post5({ event: 'not.an.event', recording: { id: 'r1' } });
+ok(JSON.stringify(H.store.st_webhookQueue || '[]') === qBefore, 'bad recording id / unknown event ignored');
+post5({ event: 'summary.completed', recording: { id: 'r2' } });
+ok(/r2/.test(H.store.st_webhookQueue), 'valid webhook queued');
+console.log('\nALL V5 PASSED');

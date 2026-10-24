@@ -185,14 +185,25 @@ function doPost(e) {
   try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); } catch (err) { body = {}; }
   const token = (e && e.parameter && e.parameter.token) || body.token;
   if (!safeEqual_(token, cfg.webhookToken)) return ContentService.createTextOutput('forbidden');
-  const action = String(e.parameter.action || body.action || '');
-  if (action) return ContentService.createTextOutput(phoneAction_(cfg, action, Object.assign({}, e.parameter, body)));
-  const id = body.recording && body.recording.id;
-  if (id) {
+  const params = (e && e.parameter) || {};
+  const rawAction = params.action || body.action;
+  if (rawAction) {
+    const action = oneOf_(rawAction, PHONE_ACTIONS_, '');
+    if (!action) return ContentService.createTextOutput('Unknown action. Use sync, todo, ask or status.');
+    return ContentService.createTextOutput(phoneAction_(cfg, action, {
+      text: cleanText_(body.text || params.text, 500),
+      q: cleanText_(body.q || params.q || body.question || params.question || body.text || params.text, 500),
+      due: validDate_(body.due || params.due),
+      category: oneOf_(body.category || params.category, CATEGORIES, 'Unsorted')
+    }));
+  }
+  const id = validRecordingId_(body.recording && body.recording.id);
+  const event = oneOf_(body.event, WEBHOOK_EVENTS_, '');
+  if (id && event) {
     const q = getState_('webhookQueue', []);
     if (q.indexOf(String(id)) < 0) q.push(String(id));
     setState_('webhookQueue', q.slice(-200));
-    if (body.event === 'recording.deleted') {
+    if (event === 'recording.deleted') {
       const del = getState_('deletedInPocket', []);
       del.push(String(id));
       setState_('deletedInPocket', del.slice(-500));
@@ -204,6 +215,32 @@ function doPost(e) {
 }
 
 /** Phone shortcuts: sync | todo | ask | status. Returns plain text for Siri / notifications. */
+const PHONE_ACTIONS_ = ['sync', 'todo', 'ask', 'status'];
+const WEBHOOK_EVENTS_ = ['transcription.completed', 'summary.completed', 'summary.regenerated', 'summary.updated', 'mind_map.completed',
+  'action_items.regenerated', 'speakers.labeled', 'transcript.edited', 'action_items.updated', 'recording.created', 'recording.deleted',
+  'recording.merged', 'translation.completed'];
+
+/** Strips control characters and limits length; returns '' for anything that is not text. */
+function cleanText_(v, max) {
+  if (typeof v !== 'string' && typeof v !== 'number') return '';
+  return String(v).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim().slice(0, max);
+}
+/** Returns v only when it is one of the allowed values. */
+function oneOf_(v, allowed, fallback) {
+  return typeof v === 'string' && allowed.indexOf(v) >= 0 ? v : fallback;
+}
+/** A real calendar date in YYYY-MM-DD form, or ''. */
+function validDate_(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return '';
+  const d = new Date(v + 'T12:00:00Z');
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v ? v : '';
+}
+/** Pocket recording ids are short opaque tokens; anything else is ignored. */
+function validRecordingId_(v) {
+  return typeof v === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(v) ? v : '';
+}
+
+/** p holds only validated fields: text, q (≤500 chars), due (YYYY-MM-DD or ''), category (Office|Personal|Unsorted). */
 function phoneAction_(cfg, action, p) {
   if (action === 'sync') {
     const pending = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'webhookSync'; });
@@ -211,7 +248,7 @@ function phoneAction_(cfg, action, p) {
     return 'Sync starts within a minute.';
   }
   if (action === 'todo') {
-    const text = String(p.text || '').trim();
+    const text = p.text;
     if (!text) return 'Say what the to-do is.';
     const ctx = openWorkspace_(cfg);
     const today = fmt_(ctx, new Date(), 'yyyy-MM-dd');
@@ -224,7 +261,7 @@ function phoneAction_(cfg, action, p) {
   }
   if (action === 'ask') {
     if (!cfg.phoneAsk) return 'Asking from the phone is turned off in Settings.';
-    const q = String(p.q || p.text || p.question || '').trim();
+    const q = p.q;
     if (!q) return 'Ask a question.';
     try {
       if (getAiKey_()) return askClaude_(q).answer;
