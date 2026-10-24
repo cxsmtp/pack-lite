@@ -4,16 +4,18 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  *  What it does (every 15 min, in Google's cloud — laptop/phone can be off):
+ *    • Least privilege: Google lets it touch ONLY the files and folders it creates
+ *      (drive.file). It cannot see anything else in your Drive.
  *    • Pulls every Pocket recording, summary, transcript, audio and to-do
  *    • Files them in Google Drive:  Life OS/<Office|Personal|Unsorted>/YYYY/MM/
  *      as searchable Google Docs  "2026-10-24 14.32 — Title — with Alice, Bob"
- *    • Pushes to-dos into Google Tasks (Gmail / Calendar sidebar) or a Calendar
+ *    • Pushes to-dos into Google Tasks (shows in Gmail and Calendar)
  *    • Learns who is Office vs Personal (asks you until it knows)
  *    • Builds a "Claude Memory" folder so a Claude Project can answer
  *      "what did I discuss with whom, and when?"
  *    • Private dashboard (phone + laptop): review, search, to-dos, settings
- *    • Drive "Inbox" folder: drop any audio (Zoom, voice memos, USB backup) and
- *      it is sent to Pocket for transcription, then filed like the rest
+ *    • Upload button in the dashboard: any audio (Zoom, voice memos, USB backup)
+ *      is sent to Pocket for transcription, then filed like the rest
  *    • Optional Claude API key: per-conversation notes from your own templates,
  *      Ask across your whole archive, weekly review, promises → to-dos
  *    • Phone shortcuts (iPhone Shortcuts / Android HTTP Shortcuts): sync, add a
@@ -30,8 +32,9 @@
  *  SETUP — about 5 minutes, no command line:
  *    1. Go to https://script.google.com → New project → name it "Pocket Life OS".
  *       Delete the sample code and paste this ENTIRE file. Save (Ctrl/Cmd+S).
- *    2. Left sidebar → "Services" (+) → choose "Google Tasks API" → Add.
- *       (Optional, recommended: puts to-dos in Gmail/Calendar's Tasks.)
+ *    2. Project Settings (gear) → tick "Show appsscript.json manifest file", then
+ *       replace appsscript.json with the one from github.com/cxsmtp/pack-lite
+ *       (it lists the narrow permissions this script uses, and Google Tasks).
  *    3. In the toolbar pick the function "setup" → Run → Review permissions →
  *       choose your account → "Advanced" → "Go to Pocket Life OS" → Allow.
  *       (Google warns because it's your own unpublished script — that's expected.)
@@ -55,7 +58,8 @@ const RUN_BUDGET_MS = 4.5 * 60 * 1000;          // Apps Script hard limit is 6 m
 const SIMPLE_DOWNLOAD_MAX = 45 * 1024 * 1024;   // UrlFetch response limit is 50 MB
 const UPLOAD_CHUNK = 16 * 1024 * 1024;          // multiple of 256 KB (Drive resumable)
 const MEMORY_FOLDER = '_Claude Memory';
-const INBOX_FOLDER = '_Inbox — drop audio here';
+const INBOX_FOLDER = '_Inbox';                   // filled by the dashboard's Upload button
+const INBOX_UPLOAD_MAX = 30 * 1024 * 1024;        // per file, through the dashboard
 const UPLOAD_MAX = 48 * 1024 * 1024;            // UrlFetch request payload limit is 50 MB
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODELS = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
@@ -67,9 +71,8 @@ const DEFAULT_CFG = {
   syncEveryMinutes: 15,
   saveAudio: true,
   saveTranscript: true,
-  todosTo: 'tasks',            // tasks | calendar | both | off
+  todosTo: 'tasks',            // tasks | off
   taskListName: 'Pocket To-dos',
-  calendarName: 'Pocket To-dos',
   defaultDueDays: 1,           // to-dos without a due date are scheduled N days after the talk (0 = no date)
   todoMaxAgeDays: 14,          // older conversations (backfill) keep to-dos in the sheet only
   pushCompletionToPocket: true,
@@ -85,7 +88,7 @@ const DEFAULT_CFG = {
   webhookToken: '',
   publicUrl: '',               // URL of the "Anyone" deployment, for webhooks and phone shortcuts
   phoneAsk: true,              // allow the "ask" phone shortcut
-  inbox: true,                 // process files dropped in the Drive inbox folder
+  inbox: true,                 // process files uploaded through the dashboard
   inboxAudio: 'pocket',        // audio with no transcript next to it: 'pocket' = send to Pocket, 'keep' = archive only
   preferredApp: 'claude',
   autoUpdate: 'auto',          // auto | ask | off: install new code from GitHub main
@@ -310,6 +313,7 @@ function api(action, args) {
     checkUpdate: apiCheckUpdate_,
     rollback: apiRollback_,
     promptFor: apiPromptFor_,
+    uploadToInbox: apiUploadToInbox_,
     saveResult: apiSaveResult_,
     newToken: function () { const c = getCfg_(); c.webhookToken = Utilities.getUuid().replace(/-/g, ''); saveCfg_(c); return apiState_(); },
     sendDigest: function () { return sendDigest_(openWorkspace_(getCfg_()), true); }
@@ -521,6 +525,315 @@ function findArray_(res) {
   return [];
 }
 
+/* ─────────────────────── Google APIs, least privilege ───────────────────── */
+//
+// Life OS asks Google only for "drive.file": it can see and change files and
+// folders it created itself, and nothing else in your Drive. Drive, Docs and
+// Sheets are used through their REST APIs (DriveApp/DocumentApp/
+// SpreadsheetApp would need access to all your files).
+
+const DRIVE_API = 'https://www.googleapis.com/drive/v3/files';
+const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
+const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+const DOC_MIME = 'application/vnd.google-apps.document';
+const FILE_FIELDS = 'id,name,mimeType,size,createdTime,parents,trashed';
+
+/** One authorised Google REST call with retries. Returns parsed JSON, text, or bytes. */
+function gapi_(method, url, opt) {
+  opt = opt || {};
+  const params = { method: method, muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } };
+  if (opt.json !== undefined) { params.contentType = 'application/json'; params.payload = JSON.stringify(opt.json); }
+  if (opt.payload !== undefined) { params.contentType = opt.contentType; params.payload = opt.payload; }
+  for (let attempt = 0; ; attempt++) {
+    const res = UrlFetchApp.fetch(url, params);
+    const code = res.getResponseCode();
+    if ((code === 429 || code >= 500) && attempt < 4) { Utilities.sleep(retryWaitMs_(res, attempt)); continue; }
+    if (code === 404) { const e = new Error('Not found'); e.httpCode = 404; throw e; }
+    if (code >= 400) {
+      let msg = 'HTTP ' + code;
+      try { msg = JSON.parse(res.getContentText()).error.message || msg; } catch (e) { /* keep */ }
+      const err = new Error('Google ' + method.toUpperCase() + ' ' + url.split('?')[0].replace(/^https:\/\/[^/]+/, '') + ': ' + msg);
+      err.httpCode = code;
+      throw err;
+    }
+    if (opt.bytes) return res.getContent();
+    if (opt.text) return res.getContentText();
+    const t = res.getContentText();
+    return t ? JSON.parse(t) : {};
+  }
+}
+
+function qEsc_(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+
+function multipart_(meta, mime, data) {
+  const boundary = 'lifeos' + Utilities.getUuid().replace(/-/g, '');
+  const head = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + JSON.stringify(meta) +
+    '\r\n--' + boundary + '\r\nContent-Type: ' + mime + '\r\n\r\n';
+  const bytes = typeof data === 'string' ? Utilities.newBlob('').setDataFromString(data, 'UTF-8').getBytes() : data;
+  const payload = Utilities.newBlob(head).getBytes().concat(bytes).concat(Utilities.newBlob('\r\n--' + boundary + '--').getBytes());
+  return { payload: payload, contentType: 'multipart/related; boundary=' + boundary };
+}
+
+/** A Drive file or folder with the small subset of the DriveApp API this script uses. */
+function DItem_(f) {
+  this.id = f.id; this.name = f.name; this.mimeType = f.mimeType || ''; this.size = Number(f.size || 0);
+  this.createdTime = f.createdTime || ''; this.parents = f.parents || []; this.trashed = !!f.trashed;
+}
+DItem_.prototype.getId = function () { return this.id; };
+DItem_.prototype.getName = function () { return this.name; };
+DItem_.prototype.getMimeType = function () { return this.mimeType; };
+DItem_.prototype.getSize = function () { return this.size; };
+DItem_.prototype.isTrashed = function () { return this.trashed; };
+DItem_.prototype.getDateCreated = function () { return this.createdTime ? new Date(this.createdTime) : new Date(); };
+DItem_.prototype.getUrl = function () {
+  if (this.mimeType === FOLDER_MIME) return 'https://drive.google.com/drive/folders/' + this.id;
+  if (this.mimeType === DOC_MIME) return 'https://docs.google.com/document/d/' + this.id + '/edit';
+  return 'https://drive.google.com/file/d/' + this.id + '/view';
+};
+DItem_.prototype.setName = function (name) {
+  gapi_('patch', DRIVE_API + '/' + this.id + '?fields=id', { json: { name: name } });
+  this.name = name;
+  return this;
+};
+DItem_.prototype.setDescription = function (d) {
+  gapi_('patch', DRIVE_API + '/' + this.id + '?fields=id', { json: { description: d } });
+  return this;
+};
+DItem_.prototype.setTrashed = function (t) {
+  gapi_('patch', DRIVE_API + '/' + this.id + '?fields=id', { json: { trashed: !!t } });
+  this.trashed = !!t;
+  return this;
+};
+DItem_.prototype.moveTo = function (folder) {
+  if (this.parents.length === 1 && this.parents[0] === folder.getId()) return this;
+  gapi_('patch', DRIVE_API + '/' + this.id + '?fields=id&addParents=' + encodeURIComponent(folder.getId()) +
+    (this.parents.length ? '&removeParents=' + encodeURIComponent(this.parents.join(',')) : ''), { json: {} });
+  this.parents = [folder.getId()];
+  return this;
+};
+DItem_.prototype.getBlob = function () {
+  const id = this.id;
+  return {
+    getBytes: function () { return gapi_('get', DRIVE_API + '/' + id + '?alt=media', { bytes: true }); },
+    getDataAsString: function () { return gapi_('get', DRIVE_API + '/' + id + '?alt=media', { text: true }); }
+  };
+};
+/** Folder: files directly inside, oldest first. */
+DItem_.prototype.getFiles = function () {
+  const list = driveList_("'" + qEsc_(this.id) + "' in parents and trashed = false and mimeType != '" + FOLDER_MIME + "'");
+  list.sort(function (a, b) { return a.createdTime.localeCompare(b.createdTime); });
+  let i = 0;
+  return { hasNext: function () { return i < list.length; }, next: function () { return list[i++]; } };
+};
+/** Folder: create a file from (name, content, mime) or from an Apps Script Blob. */
+DItem_.prototype.createFile = function (nameOrBlob, content, mime) {
+  let name = nameOrBlob, data = content, type = mime || 'text/plain';
+  if (typeof nameOrBlob !== 'string') { name = nameOrBlob.getName(); type = nameOrBlob.getContentType() || 'application/octet-stream'; data = nameOrBlob.getBytes(); }
+  const mp = multipart_({ name: name, parents: [this.id] }, type, data);
+  return new DItem_(gapi_('post', DRIVE_UPLOAD + '?uploadType=multipart&fields=' + FILE_FIELDS, mp));
+};
+
+function driveList_(q) {
+  const out = [];
+  let token = '';
+  do {
+    const r = gapi_('get', DRIVE_API + '?pageSize=1000&spaces=drive&fields=nextPageToken,files(' + FILE_FIELDS + ')&q=' +
+      encodeURIComponent(q) + (token ? '&pageToken=' + encodeURIComponent(token) : ''));
+    (r.files || []).forEach(function (f) { out.push(new DItem_(f)); });
+    token = r.nextPageToken || '';
+  } while (token);
+  return out;
+}
+
+/** A file or folder this script created; throws if it is gone or in the bin. */
+function driveItem_(id) {
+  const f = new DItem_(gapi_('get', DRIVE_API + '/' + encodeURIComponent(id) + '?fields=' + FILE_FIELDS));
+  if (f.trashed) { const e = new Error('In the bin'); e.httpCode = 404; throw e; }
+  return f;
+}
+
+function driveChildFolder_(parentId, name) {
+  const found = driveList_("name = '" + qEsc_(name) + "' and '" + qEsc_(parentId) + "' in parents and mimeType = '" + FOLDER_MIME + "' and trashed = false");
+  if (found.length) return found[0];
+  return new DItem_(gapi_('post', DRIVE_API + '?fields=' + FILE_FIELDS, { json: { name: name, mimeType: FOLDER_MIME, parents: [parentId] } }));
+}
+
+/** Creates or replaces a Google Doc from HTML (Drive converts it). Returns the file. */
+function upsertDoc_(docId, name, folder, html) {
+  let existing = null;
+  if (docId) { try { existing = driveItem_(docId); } catch (e) { existing = null; } }
+  if (existing) {
+    const mp = multipart_({ name: name }, 'text/html', html);
+    gapi_('patch', DRIVE_UPLOAD + '/' + existing.getId() + '?uploadType=multipart&fields=id', mp);
+    existing.name = name;
+    existing.moveTo(folder);
+    return existing;
+  }
+  const mp = multipart_({ name: name, mimeType: DOC_MIME, parents: [folder.getId()] }, 'text/html', html);
+  return new DItem_(gapi_('post', DRIVE_UPLOAD + '?uploadType=multipart&fields=' + FILE_FIELDS, mp));
+}
+
+function docExport_(docId, mime) {
+  return gapi_('get', DRIVE_API + '/' + encodeURIComponent(docId) + '/export?mimeType=' + encodeURIComponent(mime), { text: true });
+}
+
+/* ── HTML that becomes a Google Doc ── */
+
+function h_(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; });
+}
+function docHtml_(title, body) {
+  return '<html><head><meta charset="utf-8"><title>' + h_(title) + '</title></head>' +
+    '<body style="font-family:Arial,sans-serif;font-size:11pt;color:#0f172a">' + body + '</body></html>';
+}
+function mutedP_(text, size) {
+  return '<p style="color:#64748b;font-size:' + (size || 9) + 'pt">' + h_(text) + '</p>';
+}
+
+/** Markdown → HTML: headings, nested bullet/numbered lists, checkboxes, quotes, **bold**. Everything escaped. */
+function mdToHtml_(md, headingStyle) {
+  const inline = function (s) {
+    return h_(String(s).replace(/`/g, '').replace(/__(.+?)__/g, '**$1**')).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(^|\s)\*(\S[^*]*)\*/g, '$1<i>$2</i>');
+  };
+  let html = '', list = null;
+  const close = function () { if (list) { html += '</' + list + '>'; list = null; } };
+  String(md || '').split(/\r?\n/).forEach(function (line) {
+    const t = line.trim();
+    if (!t || /^[-*_]{3,}$/.test(t)) { close(); return; }
+    const nested = line.match(/^\s*/)[0].length >= 2 ? ' style="margin-left:24px"' : '';
+    let m;
+    if ((m = t.match(/^(#{1,6})\s+(.*)$/))) {
+      close();
+      const lvl = m[1].length <= 2 ? 3 : 4;
+      html += '<h' + lvl + (headingStyle ? ' style="' + headingStyle + '"' : '') + '>' + inline(m[2]) + '</h' + lvl + '>';
+    } else if ((m = t.match(/^[-*•+]\s+\[( |x|X)\]\s+(.*)$/))) {
+      if (list !== 'ul') { close(); html += '<ul>'; list = 'ul'; }
+      html += '<li' + nested + '>' + (m[1] === ' ' ? '☐ ' : '☑ ') + inline(m[2]) + '</li>';
+    } else if ((m = t.match(/^[-*•+]\s+(.*)$/))) {
+      if (list !== 'ul') { close(); html += '<ul>'; list = 'ul'; }
+      html += '<li' + nested + '>' + inline(m[1]) + '</li>';
+    } else if ((m = t.match(/^\d+[.)]\s+(.*)$/))) {
+      if (list !== 'ol') { close(); html += '<ol>'; list = 'ol'; }
+      html += '<li' + nested + '>' + inline(m[1]) + '</li>';
+    } else if ((m = t.match(/^>\s?(.*)$/))) {
+      close();
+      html += '<p style="margin-left:18px;font-style:italic">' + inline(m[1]) + '</p>';
+    } else {
+      close();
+      html += '<p>' + inline(t) + '</p>';
+    }
+  });
+  close();
+  return html;
+}
+
+/* ── Index spreadsheet through the Sheets API (values written RAW: nothing is ever read as a formula) ── */
+
+function colLetter_(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
+function sheetRange_(name, a1) { return encodeURIComponent("'" + name.replace(/'/g, "''") + "'!" + a1); }
+
+/** Opens (or creates) the index spreadsheet and loads every table in two API calls. */
+function openIndex_(ctx, specs) {
+  let id = getState_('sheetId', '');
+  if (id) { try { driveItem_(id); } catch (e) { id = ''; } }
+  if (!id) {
+    const created = gapi_('post', SHEETS_API, { json: { properties: { title: 'Life OS — Index' },
+      sheets: specs.map(function (s) { return { properties: { title: s.name, gridProperties: { frozenRowCount: 1 } } }; }) } });
+    id = created.spreadsheetId;
+    driveItem_(id).moveTo(ctx.root);
+    setState_('sheetId', id);
+  }
+  const meta = gapi_('get', SHEETS_API + '/' + id + '?fields=sheets.properties(sheetId,title)');
+  const have = {};
+  (meta.sheets || []).forEach(function (s) { have[s.properties.title] = s.properties.sheetId; });
+  const missing = specs.filter(function (s) { return have[s.name] === undefined; });
+  if (missing.length) {
+    const r = gapi_('post', SHEETS_API + '/' + id + ':batchUpdate', { json: { requests: missing.map(function (s) {
+      return { addSheet: { properties: { title: s.name, gridProperties: { frozenRowCount: 1 } } } }; }) } });
+    (r.replies || []).forEach(function (rep, i) { have[missing[i].name] = rep.addSheet.properties.sheetId; });
+  }
+  const got = gapi_('get', SHEETS_API + '/' + id + '/values:batchGet?majorDimension=ROWS&' +
+    specs.map(function (s) { return 'ranges=' + sheetRange_(s.name, 'A1:' + colLetter_(s.cols.length)); }).join('&'));
+  const ss = { id: id, sheetIds: have, getUrl: function () { return 'https://docs.google.com/spreadsheets/d/' + id + '/edit'; } };
+  const tables = {};
+  const headerFix = [];
+  specs.forEach(function (s, i) {
+    const values = (got.valueRanges && got.valueRanges[i] && got.valueRanges[i].values) || [];
+    const t = new Table_(ss, s.name, s.cols, values);
+    if (!values.length || values[0].length < s.cols.length) headerFix.push(s);
+    tables[s.key] = t;
+  });
+  if (headerFix.length) {
+    gapi_('post', SHEETS_API + '/' + id + '/values:batchUpdate', { json: { valueInputOption: 'RAW', data: headerFix.map(function (s) {
+      return { range: "'" + s.name + "'!A1:" + colLetter_(s.cols.length) + '1', values: [s.cols.map(function (c) { return c[1]; })] }; }) } });
+    gapi_('post', SHEETS_API + '/' + id + ':batchUpdate', { json: { requests: headerFix.map(function (s) {
+      return { repeatCell: { range: { sheetId: have[s.name], startRowIndex: 0, endRowIndex: 1 },
+        cell: { userEnteredFormat: { textFormat: { bold: true, foregroundColor: { red: 1, green: 1, blue: 1 } }, backgroundColor: { red: 0.12, green: 0.16, blue: 0.22 } } },
+        fields: 'userEnteredFormat(textFormat,backgroundColor)' } }; }) } });
+  }
+  ctx.ss = ss;
+  return tables;
+}
+
+/** Sheet-backed table keyed by its first column. values = rows incl. header, as returned by the API. */
+function Table_(ss, name, cols, values) {
+  const self = this;
+  this.ss = ss; this.name = name; this.cols = cols;
+  this.keys = cols.map(function (c) { return c[0]; });
+  this.rows = []; this.index = {};
+  this.nextRow = Math.max(2, (values || []).length + 1);
+  (values || []).slice(1).forEach(function (v, i) {
+    const o = { _row: i + 2 };
+    self.keys.forEach(function (k, j) { o[k] = String(v[j] == null ? '' : v[j]); });
+    if (!o[self.keys[0]]) return;
+    self.rows.push(o);
+    self.index[o[self.keys[0]]] = o;
+  });
+}
+Table_.prototype.get = function (key) { return this.index[String(key)] || null; };
+Table_.prototype.upsert = function (obj) {
+  const key = String(obj[this.keys[0]]);
+  const cur = this.index[key];
+  const merged = Object.assign({}, cur || {}, obj);
+  const row = this.keys.map(function (k) { return safeCell_(merged[k]); });
+  const last = colLetter_(this.cols.length);
+  if (cur) {
+    gapi_('put', SHEETS_API + '/' + this.ss.id + '/values/' + sheetRange_(this.name, 'A' + cur._row + ':' + last + cur._row) + '?valueInputOption=RAW',
+      { json: { values: [row] } });
+    Object.assign(cur, merged);
+    return cur;
+  }
+  const r = gapi_('post', SHEETS_API + '/' + this.ss.id + '/values/' + sheetRange_(this.name, 'A1:' + last) + ':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',
+    { json: { values: [row] } });
+  const m = String((r.updates && r.updates.updatedRange) || '').match(/!A(\d+)/);
+  merged._row = m ? Number(m[1]) : this.nextRow;
+  this.nextRow = merged._row + 1;
+  this.rows.push(merged);
+  this.index[key] = merged;
+  return merged;
+};
+/** Appends a row that has no key (log lines). */
+Table_.prototype.append = function (row) {
+  gapi_('post', SHEETS_API + '/' + this.ss.id + '/values/' + sheetRange_(this.name, 'A1:' + colLetter_(this.cols.length)) + ':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',
+    { json: { values: [row.map(safeCell_)] } });
+  this.nextRow++;
+};
+/** Keeps only the newest `keep` data rows. */
+Table_.prototype.trim = function (keep) {
+  const extra = this.nextRow - 2 - keep;
+  if (extra <= 0) return;
+  gapi_('post', SHEETS_API + '/' + this.ss.id + ':batchUpdate', { json: { requests: [{ deleteDimension: {
+    range: { sheetId: this.ss.sheetIds[this.name], dimension: 'ROWS', startIndex: 1, endIndex: 1 + extra } } }] } });
+  this.nextRow -= extra;
+};
+
+function safeCell_(v) {
+  if (v === undefined || v === null) return '';
+  const s = typeof v === 'string' ? v : String(v);
+  return s.length > 45000 ? s.slice(0, 45000) + '…' : s;
+}
+
 /* ───────────────────────────── Google workspace ─────────────────────────── */
 
 const CONV_COLS = [
@@ -546,112 +859,38 @@ function openWorkspace_(cfg) {
   const ctx = { cfg: cfg, tz: cfg.timezone, folderCache: {}, dirtyMonths: {}, peopleDirty: false,
     stats: { listed: 0, processed: 0, created: 0, updated: 0, todos: 0, audio: 0, errors: 0, skipped: 0 }, errors: [] };
   ctx.root = getOrCreateRoot_(cfg);
-  ctx.ss = getOrCreateSheet_(ctx);
-  ctx.conv = new Table_(ctx.ss, 'Conversations', CONV_COLS);
-  ctx.people = new Table_(ctx.ss, 'People', PEOPLE_COLS);
-  ctx.todos = new Table_(ctx.ss, 'To-dos', TODO_COLS);
-  ctx.logT = new Table_(ctx.ss, 'Log', LOG_COLS);
-  ctx.uploads = new Table_(ctx.ss, 'Uploads', UPLOAD_COLS);
+  const t = openIndex_(ctx, [
+    { key: 'conv', name: 'Conversations', cols: CONV_COLS }, { key: 'people', name: 'People', cols: PEOPLE_COLS },
+    { key: 'todos', name: 'To-dos', cols: TODO_COLS }, { key: 'logT', name: 'Log', cols: LOG_COLS },
+    { key: 'uploads', name: 'Uploads', cols: UPLOAD_COLS }]);
+  ctx.conv = t.conv; ctx.people = t.people; ctx.todos = t.todos; ctx.logT = t.logT; ctx.uploads = t.uploads;
   return ctx;
 }
 
 function getOrCreateRoot_(cfg) {
   const id = getState_('rootId', '');
   if (id) {
-    try { const f = DriveApp.getFolderById(id); if (!f.isTrashed()) { if (f.getName() !== cfg.rootFolderName) f.setName(cfg.rootFolderName); return f; } } catch (e) { /* recreate */ }
+    try { const f = driveItem_(id); if (f.getName() !== cfg.rootFolderName) f.setName(cfg.rootFolderName); return f; } catch (e) { /* recreate */ }
   }
-  const it = DriveApp.getRootFolder().getFoldersByName(cfg.rootFolderName);
-  const f = it.hasNext() ? it.next() : DriveApp.getRootFolder().createFolder(cfg.rootFolderName);
-  f.setDescription('Managed by ' + APP_NAME + '. Conversations from Pocket, filed by date and Office/Personal.');
+  const found = driveList_("name = '" + qEsc_(cfg.rootFolderName) + "' and 'root' in parents and mimeType = '" + FOLDER_MIME + "' and trashed = false");
+  const f = found.length ? found[0] : new DItem_(gapi_('post', DRIVE_API + '?fields=' + FILE_FIELDS, { json: {
+    name: cfg.rootFolderName, mimeType: FOLDER_MIME, parents: ['root'],
+    description: 'Managed by ' + APP_NAME + '. Conversations from Pocket, filed by date and Office/Personal.' } }));
   setState_('rootId', f.getId());
   return f;
 }
 
-function getOrCreateSheet_(ctx) {
-  const id = getState_('sheetId', '');
-  if (id) { try { const f = DriveApp.getFileById(id); if (!f.isTrashed()) return SpreadsheetApp.openById(id); } catch (e) { /* recreate */ } }
-  const ss = SpreadsheetApp.create('Life OS — Index');
-  DriveApp.getFileById(ss.getId()).moveTo(ctx.root);
-  setState_('sheetId', ss.getId());
-  return ss;
-}
 
-/** Minimal sheet-backed table keyed by its first column. */
-function Table_(ss, name, cols) {
-  this.cols = cols;
-  this.keys = cols.map(function (c) { return c[0]; });
-  let sh = ss.getSheetByName(name);
-  if (!sh) {
-    const blank = ss.getSheets().filter(function (s) { return s.getName() === 'Sheet1' && s.getLastRow() === 0; })[0];
-    sh = blank ? blank.setName(name) : ss.insertSheet(name);
-    sh.getRange(1, 1, 1, cols.length).setValues([cols.map(function (c) { return c[1]; })])
-      .setFontWeight('bold').setBackground('#1f2937').setFontColor('#ffffff');
-    sh.setFrozenRows(1);
-    sh.getRange(1, 1, sh.getMaxRows(), cols.length).setNumberFormat('@');
-  }
-  else if (sh.getLastColumn() < cols.length) {
-    sh.getRange(1, 1, 1, cols.length).setValues([cols.map(function (c) { return c[1]; })])
-      .setFontWeight('bold').setBackground('#1f2937').setFontColor('#ffffff');
-    sh.getRange(1, 1, sh.getMaxRows(), cols.length).setNumberFormat('@');
-  }
-  this.sheet = sh;
-  this.load();
-}
-Table_.prototype.load = function () {
-  const self = this;
-  const last = this.sheet.getLastRow();
-  const values = last > 1 ? this.sheet.getRange(2, 1, last - 1, this.cols.length).getValues() : [];
-  this.rows = [];
-  this.index = {};
-  values.forEach(function (v, i) {
-    const o = { _row: i + 2 };
-    self.keys.forEach(function (k, j) { o[k] = v[j] instanceof Date ? v[j].toISOString() : String(v[j] == null ? '' : v[j]); });
-    if (!o[self.keys[0]]) return;
-    self.rows.push(o);
-    self.index[o[self.keys[0]]] = o;
-  });
-};
-Table_.prototype.get = function (key) { return this.index[String(key)] || null; };
-Table_.prototype.upsert = function (obj) {
-  const key = String(obj[this.keys[0]]);
-  const cur = this.index[key];
-  const merged = Object.assign({}, cur || {}, obj);
-  const row = this.keys.map(function (k) { return safeCell_(merged[k]); });
-  if (cur) {
-    this.sheet.getRange(cur._row, 1, 1, row.length).setValues([row]);
-    Object.assign(cur, merged);
-    return cur;
-  }
-  if (this.sheet.getLastRow() + 5 >= this.sheet.getMaxRows()) {
-    this.sheet.insertRowsAfter(this.sheet.getMaxRows(), 1000);
-    this.sheet.getRange(1, 1, this.sheet.getMaxRows(), this.cols.length).setNumberFormat('@');
-  }
-  this.sheet.appendRow(row);
-  merged._row = this.sheet.getLastRow();
-  this.rows.push(merged);
-  this.index[key] = merged;
-  return merged;
-};
-function safeCell_(v) {
-  if (v === undefined || v === null) return '';
-  let s = typeof v === 'string' ? v : String(v);
-  if (/^[=+\-@]/.test(s)) s = "'" + s;   // never let transcript text become a formula
-  return s.length > 45000 ? s.slice(0, 45000) + '…' : s;
-}
+
 
 function log_(ctx, level, message) {
   try {
-    const sh = ctx.logT.sheet;
-    sh.insertRowAfter(1);
-    sh.getRange(2, 1, 1, 3).setValues([[nowIso_(), level, safeCell_(String(message).slice(0, 2000))]]);
-    if (sh.getLastRow() > 600) sh.deleteRows(501, sh.getLastRow() - 500);
+    ctx.logT.append([nowIso_(), level, String(message).slice(0, 2000)]);
+    if (ctx.logT.nextRow > 700) ctx.logT.trim(500);
   } catch (e) { console.log(level + ': ' + message); }
 }
 
-function child_(parent, name) {
-  const it = parent.getFoldersByName(name);
-  return it.hasNext() ? it.next() : parent.createFolder(name);
-}
+function child_(parent, name) { return driveChildFolder_(parent.getId(), name); }
 function folderPath_(ctx, parts) {
   const key = parts.join('/');
   if (ctx.folderCache[key]) return ctx.folderCache[key];
@@ -663,11 +902,7 @@ function folderPath_(ctx, parts) {
 function monthFolder_(ctx, category, date) {
   return folderPath_(ctx, [category, fmt_(ctx, date, 'yyyy'), fmt_(ctx, date, 'MM — MMMM')]);
 }
-function moveIfNeeded_(file, folder) {
-  const parents = file.getParents();
-  if (parents.hasNext() && parents.next().getId() === folder.getId()) return;
-  file.moveTo(folder);
-}
+function moveIfNeeded_(file, folder) { file.moveTo(folder); }
 
 /* ─────────────────────────────── sync engine ────────────────────────────── */
 
@@ -819,7 +1054,7 @@ function processInfo_(ctx, info, opt) {
   let audioUrl = row && row.audioUrl;
   let audioTries = Number((row && row.audioTries) || 0);
   if (audioId) {
-    try { const af = DriveApp.getFileById(audioId); moveIfNeeded_(af, folder); renameKeepExt_(af, base); } catch (e) { audioId = ''; }
+    try { const af = driveItem_(audioId); moveIfNeeded_(af, folder); renameKeepExt_(af, base); } catch (e) { audioId = ''; }
   }
   if (!audioId && opt.localAudio) {
     opt.localAudio.moveTo(folder);
@@ -1039,85 +1274,45 @@ function baseName_(ctx, info) {
 }
 
 function writeDoc_(ctx, info, cls, docId, folder, name, audioUrl) {
-  let doc = null;
-  if (docId) { try { doc = DocumentApp.openById(docId); } catch (e) { doc = null; } }
-  if (!doc) {
-    doc = DocumentApp.create(name);
-    DriveApp.getFileById(doc.getId()).moveTo(folder);
-  } else {
-    if (doc.getName() !== name) doc.setName(name);
-    moveIfNeeded_(DriveApp.getFileById(doc.getId()), folder);
-  }
-  const D = DocumentApp;
-  const body = doc.getBody();
-  body.clear();
-  body.setMarginTop(48).setMarginBottom(48);
-
-  const title = body.getChild(0).asParagraph();
-  title.setHeading(D.ParagraphHeading.TITLE).setText((info.emoji ? info.emoji + ' ' : '') + info.title);
-
   const when = info.weekday + ', ' + fmt_(ctx, info.start, 'd MMMM yyyy') + ' · ' + info.time + '–' + info.endTime + ' (' + ctx.tz + ')';
   const meta = [
-    ['When', when],
-    ['Duration', fmtDuration_(info.durationSec) + (transcriptCut_(info) ? '  ⚠ transcript stops at ' + hms_(info.transcriptEnd) + ': transcribe the rest from the audio (Life OS → Send to)' : '')],
-    ['Category', cls.category + '  (filed by ' + cls.source + ')'],
-    ['With', info.people.length ? info.people.join(', ') : '— (name speakers in Pocket and they appear here)'],
-    ['Tags', info.tags.join(', ') || '—'],
-    ['Pocket folder', info.folderName || '—'],
-    ['Audio', audioUrl ? 'Play recording' : (ctx.cfg.saveAudio ? 'pending' : 'not saved')],
-    ['Pocket ID', info.id]
+    ['When', h_(when)],
+    ['Duration', h_(fmtDuration_(info.durationSec) + (transcriptCut_(info) ? '  ⚠ transcript stops at ' + hms_(info.transcriptEnd) + ': transcribe the rest from the audio (Life OS → Send to)' : ''))],
+    ['Category', h_(cls.category + '  (filed by ' + cls.source + ')')],
+    ['With', h_(info.people.length ? info.people.join(', ') : '— (name speakers in Pocket and they appear here)')],
+    ['Tags', h_(info.tags.join(', ') || '—')],
+    ['Pocket folder', h_(info.folderName || '—')],
+    ['Audio', audioUrl ? '<a href="' + h_(audioUrl) + '">Play recording</a>' : (ctx.cfg.saveAudio ? 'pending' : 'not saved')],
+    ['Pocket ID', h_(info.id)]
   ];
-  const table = body.appendTable(meta);
-  table.setBorderColor('#e5e7eb');
-  for (let r = 0; r < table.getNumRows(); r++) {
-    const k = table.getCell(r, 0), v = table.getCell(r, 1);
-    k.setWidth(110).setBackgroundColor('#f8fafc');
-    k.editAsText().setBold(true).setFontSize(9).setForegroundColor('#475569');
-    v.editAsText().setFontSize(10);
-    if (meta[r][0] === 'Audio' && audioUrl) v.editAsText().setLinkUrl(audioUrl);
-  }
-  const search = body.appendParagraph('#' + cls.category.toLowerCase() + ' #' + info.date + ' ' + info.people.map(function (p) { return '@' + p.replace(/\s+/g, ''); }).join(' '));
-  search.editAsText().setFontSize(8).setForegroundColor('#94a3b8');
+  let b = '<h1>' + h_((info.emoji ? info.emoji + ' ' : '') + info.title) + '</h1>';
+  b += '<table style="border-collapse:collapse;border:1px solid #e5e7eb">' + meta.map(function (r) {
+    return '<tr><td style="background:#f8fafc;font-weight:bold;font-size:9pt;color:#475569;padding:4px 8px;width:110px">' + r[0] +
+      '</td><td style="font-size:10pt;padding:4px 8px">' + r[1] + '</td></tr>';
+  }).join('') + '</table>';
+  b += mutedP_('#' + cls.category.toLowerCase() + ' #' + info.date + ' ' + info.people.map(function (p) { return '@' + p.replace(/\s+/g, ''); }).join(' '), 8);
 
-  body.appendParagraph('Summary').setHeading(D.ParagraphHeading.HEADING1);
-  if (info.markdown) renderMarkdown_(body, info.markdown);
-  else if (info.bullets.length) info.bullets.forEach(function (b) { richText_(body.appendListItem(''), b); });
-  else body.appendParagraph(info.errors.length ? 'Pocket reported: ' + info.errors.join('; ') : 'Pocket has not produced a summary yet — this doc refreshes automatically.').editAsText().setItalic(true);
-
+  b += '<h2>Summary</h2>';
+  if (info.markdown) b += mdToHtml_(info.markdown);
+  else if (info.bullets.length) b += '<ul>' + info.bullets.map(function (x) { return '<li>' + h_(x) + '</li>'; }).join('') + '</ul>';
+  else b += '<p><i>' + h_(info.errors.length ? 'Pocket reported: ' + info.errors.join('; ') : 'Pocket has not produced a summary yet — this doc refreshes automatically.') + '</i></p>';
   if (info.markdown && info.bullets.length) {
-    body.appendParagraph('Key points').setHeading(D.ParagraphHeading.HEADING2);
-    info.bullets.forEach(function (b) { richText_(body.appendListItem(''), b); });
+    b += '<h3>Key points</h3><ul>' + info.bullets.map(function (x) { return '<li>' + mdInline_(x) + '</li>'; }).join('') + '</ul>';
   }
-
-  if (info.ai) renderClaudeNotes_(body, info.ai);
-
+  if (info.ai) b += claudeNotesHtml_(info.ai);
   if (info.actionItems.length) {
-    body.appendParagraph('Action items').setHeading(D.ParagraphHeading.HEADING1);
-    info.actionItems.forEach(function (a) {
+    b += '<h2>Action items</h2><ul>' + info.actionItems.map(function (a) {
       const extra = [a.due ? 'due ' + a.due : '', a.assignee ? '@' + a.assignee : '', a.priority ? a.priority.toLowerCase() : ''].filter(Boolean).join(' · ');
-      const li = body.appendListItem((a.done ? '☑ ' : '☐ ') + a.title + (extra ? '  — ' + extra : ''));
-      li.setGlyphType(D.GlyphType.HOLLOW_BULLET);
-      if (extra) li.editAsText().setForegroundColor(li.getText().length - extra.length, li.getText().length - 1, '#64748b');
-    });
+      return '<li>' + (a.done ? '☑ ' : '☐ ') + h_(a.title) + (extra ? ' <span style="color:#64748b">— ' + h_(extra) + '</span>' : '') + '</li>';
+    }).join('') + '</ul>';
   }
-
   if (ctx.cfg.saveTranscript && info.segments.length) {
-    body.appendParagraph('Transcript').setHeading(D.ParagraphHeading.HEADING1);
-    mergeSegments_(info).forEach(function (s) {
-      const stamp = '[' + hms_(s.start) + '] ';
-      const who = s.name + ': ';
-      const p = body.appendParagraph(stamp + who + s.text);
-      const t = p.editAsText();
-      t.setFontSize(10);
-      t.setForegroundColor(0, stamp.length - 1, '#94a3b8');
-      t.setBold(stamp.length, stamp.length + who.length - 1, true);
-    });
+    b += '<h2>Transcript</h2>' + mergeSegments_(info).map(function (sg) {
+      return '<p style="font-size:10pt"><span style="color:#94a3b8">[' + hms_(sg.start) + ']</span> <b>' + h_(sg.name) + ':</b> ' + h_(sg.text) + '</p>';
+    }).join('');
   }
-
-  const foot = body.appendParagraph('Synced by ' + APP_NAME + ' · ' + fmt_(ctx, new Date(), 'yyyy-MM-dd HH:mm') + ' · ' + (info.local ? 'imported from your inbox' : 'source of truth: Pocket recording ' + info.id));
-  foot.editAsText().setFontSize(8).setForegroundColor('#94a3b8');
-  doc.saveAndClose();
-  return doc.getId();
+  b += mutedP_('Synced by ' + APP_NAME + ' · ' + fmt_(ctx, new Date(), 'yyyy-MM-dd HH:mm') + ' · ' + (info.local ? 'imported from your inbox' : 'source of truth: Pocket recording ' + info.id), 8);
+  return upsertDoc_(docId, name, folder, docHtml_(name, b)).getId();
 }
 
 function transcriptCut_(info) {
@@ -1145,46 +1340,13 @@ function prettySpeaker_(label) {
   return m ? 'Speaker ' + (Number(m[1]) + 1) : (label || 'Speaker');
 }
 
-function renderMarkdown_(body, md) {
-  const D = DocumentApp;
-  String(md).split(/\r?\n/).forEach(function (line) {
-    const t = line.trim();
-    if (!t || /^[-*_]{3,}$/.test(t)) return;
-    const indent = (line.match(/^\s*/)[0].length >= 2) ? 1 : 0;
-    let m;
-    if ((m = t.match(/^(#{1,6})\s+(.*)$/))) {
-      const p = body.appendParagraph(stripMd_(m[2]));
-      p.setHeading(m[1].length <= 2 ? D.ParagraphHeading.HEADING2 : D.ParagraphHeading.HEADING3);
-    } else if ((m = t.match(/^[-*•+]\s+\[( |x|X)\]\s+(.*)$/))) {
-      richText_(body.appendListItem(''), (m[1] === ' ' ? '☐ ' : '☑ ') + m[2]).setNestingLevel(indent);
-    } else if ((m = t.match(/^[-*•+]\s+(.*)$/))) {
-      richText_(body.appendListItem(''), m[1]).setNestingLevel(indent);
-    } else if ((m = t.match(/^\d+[.)]\s+(.*)$/))) {
-      richText_(body.appendListItem(''), m[1]).setGlyphType(D.GlyphType.NUMBER).setNestingLevel(indent);
-    } else if ((m = t.match(/^>\s?(.*)$/))) {
-      richText_(body.appendParagraph(''), m[1]).setIndentStart(18).editAsText().setItalic(true);
-    } else {
-      richText_(body.appendParagraph(''), t);
-    }
-  });
+function mdInline_(s) {
+  return h_(String(s).replace(/`/g, '').replace(/__(.+?)__/g, '**$1**')).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 }
 
 /** Writes text into a paragraph/list item, turning **bold** into real bold. */
-function richText_(el, text) {
-  const parts = String(text).replace(/__(.+?)__/g, '**$1**').split('**');
-  let plain = '';
-  const bold = [];
-  parts.forEach(function (p, i) {
-    p = p.replace(/`/g, '').replace(/(^|\s)\*(\S[^*]*)\*/g, '$1$2');
-    if (i % 2 === 1 && p) bold.push([plain.length, plain.length + p.length - 1]);
-    plain += p;
-  });
-  el.setText(plain || ' ');
-  const t = el.editAsText();
-  bold.forEach(function (b) { if (b[1] >= b[0]) t.setBold(b[0], b[1], true); });
-  return el;
-}
-function stripMd_(s) { return String(s).replace(/\*\*|__|`/g, ''); }
+
+
 
 /* ──────────────────────────────── audio ─────────────────────────────────── */
 
@@ -1242,7 +1404,7 @@ function saveAudio_(ctx, info, folder, base) {
     up.next = c === 308 && range ? Number(String(range).split('-')[1]) + 1 : endB + 1;
   }
   setState_(stateKey, null);
-  return DriveApp.getFileById(JSON.parse(last.getContentText()).id);
+  return driveItem_(JSON.parse(last.getContentText()).id);
 }
 
 function audioExt_(type, url) {
@@ -1307,27 +1469,17 @@ function todoNotes_(row) {
 }
 
 function pushTodo_(ctx, row) {
-  const mode = ctx.cfg.todosTo;
   const out = {};
-  const useTasks = (mode === 'tasks' || mode === 'both') && hasTasks_();
-  if (useTasks) {
-    const t = { title: row.title, notes: todoNotes_(row) };
-    if (row.due) t.due = row.due + 'T00:00:00.000Z';
-    out.taskId = Tasks.Tasks.insert(t, taskListId_(ctx)).id;
-  }
-  if ((mode === 'calendar' || mode === 'both' || (mode === 'tasks' && !hasTasks_())) && row.due) {
-    const ev = todoCalendar_(ctx).createAllDayEvent('☐ ' + row.title, localDate_(row.due), { description: todoNotes_(row) });
-    out.eventId = ev.getId();
-  }
+  if (ctx.cfg.todosTo === 'off' || !hasTasks_()) return out;
+  const t = { title: row.title, notes: todoNotes_(row) };
+  if (row.due) t.due = row.due + 'T00:00:00.000Z';
+  out.taskId = Tasks.Tasks.insert(t, taskListId_(ctx)).id;
   return out;
 }
 
 function completeExternal_(ctx, row) {
   if (row.taskId && hasTasks_()) {
     try { Tasks.Tasks.patch({ status: 'completed' }, taskListId_(ctx), row.taskId); } catch (e) { /* task deleted by you */ }
-  }
-  if (row.eventId) {
-    try { const ev = todoCalendar_(ctx).getEventById(row.eventId); if (ev) ev.setTitle('✓ ' + row.title); } catch (e) { /* event deleted */ }
   }
 }
 
@@ -1343,12 +1495,7 @@ function taskListId_(ctx) {
   return id;
 }
 
-function todoCalendar_(ctx) {
-  if (ctx.todoCal) return ctx.todoCal;
-  const cals = CalendarApp.getCalendarsByName(ctx.cfg.calendarName);
-  ctx.todoCal = cals.length ? cals[0] : CalendarApp.createCalendar(ctx.cfg.calendarName, { color: CalendarApp.Color.ORANGE, summary: 'To-dos from Pocket conversations' });
-  return ctx.todoCal;
-}
+
 
 /** Two-way: to-dos you tick off in Google Tasks are closed here and in Pocket. */
 function refreshTodoStatus_(ctx) {
@@ -1381,14 +1528,11 @@ function memoryFolder_(ctx) { return folderPath_(ctx, [MEMORY_FOLDER]); }
 
 function ensureClaudeReadme_(ctx) {
   const ids = getState_('memoryDocs', {});
-  if (ids.readme) { try { DriveApp.getFileById(ids.readme); return; } catch (e) { /* recreate */ } }
-  const doc = DocumentApp.create('00 — READ ME FIRST (instructions for Claude)');
-  DriveApp.getFileById(doc.getId()).moveTo(memoryFolder_(ctx));
-  const b = doc.getBody();
-  b.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.TITLE).setText('How to use this archive (for Claude)');
-  CLAUDE_INSTRUCTIONS_().split('\n').forEach(function (l) { if (l.trim()) b.appendParagraph(l); });
-  doc.saveAndClose();
-  ids.readme = doc.getId();
+  if (ids.readme) { try { driveItem_(ids.readme); return; } catch (e) { /* recreate */ } }
+  const title = '00 — READ ME FIRST (instructions for Claude)';
+  const body = '<h1>How to use this archive (for Claude)</h1>' + CLAUDE_INSTRUCTIONS_().split('\n').filter(function (l) { return l.trim(); })
+    .map(function (l) { return '<p>' + h_(l) + '</p>'; }).join('');
+  ids.readme = upsertDoc_('', title, memoryFolder_(ctx), docHtml_(title, body)).getId();
   setState_('memoryDocs', ids);
 }
 
@@ -1421,79 +1565,53 @@ function rebuildMemory_(ctx, months) {
   }
 }
 
-function memoryDoc_(ctx, key, title) {
+function memoryDoc_(ctx, key, title, body) {
   const ids = getState_('memoryDocs', {});
-  let doc = null;
-  if (ids[key]) { try { doc = DocumentApp.openById(ids[key]); } catch (e) { doc = null; } }
-  if (!doc) {
-    doc = DocumentApp.create(title);
-    DriveApp.getFileById(doc.getId()).moveTo(memoryFolder_(ctx));
-    ids[key] = doc.getId();
-    setState_('memoryDocs', ids);
-  }
-  if (doc.getName() !== title) doc.setName(title);
-  doc.getBody().clear();
-  return doc;
+  const f = upsertDoc_(ids[key] || '', title, memoryFolder_(ctx), docHtml_(title, body));
+  if (ids[key] !== f.getId()) { ids[key] = f.getId(); setState_('memoryDocs', ids); }
+  return f;
 }
 
 function writeMonthDoc_(ctx, month, rows, todosByConv) {
-  const D = DocumentApp;
   const label = Utilities.formatDate(new Date(month + '-15T12:00:00Z'), 'Etc/UTC', 'MMMM yyyy');
-  const doc = memoryDoc_(ctx, 'm' + month, 'Memory — ' + month + ' (' + label + ')');
-  const b = doc.getBody();
-  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('Conversations — ' + label);
-  b.appendParagraph(rows.length + ' conversations · ' + Math.round(rows.reduce(function (s, r) { return s + Number(r.durationMin || 0); }, 0) / 6) / 10 + ' hours · times in ' + ctx.tz)
-    .editAsText().setForegroundColor('#64748b');
+  let b = '<h1>Conversations — ' + h_(label) + '</h1>' +
+    mutedP_(rows.length + ' conversations · ' + Math.round(rows.reduce(function (s2, r) { return s2 + Number(r.durationMin || 0); }, 0) / 6) / 10 + ' hours · times in ' + ctx.tz, 10);
   rows.forEach(function (r) {
-    const h = b.appendParagraph(r.date + ' ' + r.time + '–' + r.endTime + ' · ' + r.category + ' · ' + r.title);
-    h.setHeading(D.ParagraphHeading.HEADING2);
-    if (r.docUrl) h.setLinkUrl(r.docUrl);
-    b.appendParagraph('With: ' + (r.people || '—') + (r.tags ? ' · Tags: ' + r.tags : '') + ' · ' + r.durationMin + ' min').editAsText().setFontSize(9).setForegroundColor('#64748b');
-    if (r.summary) b.appendParagraph(r.summary);
+    const head = h_(r.date + ' ' + r.time + '–' + r.endTime + ' · ' + r.category + ' · ' + r.title);
+    b += '<h2>' + (r.docUrl ? '<a href="' + h_(r.docUrl) + '">' + head + '</a>' : head) + '</h2>';
+    b += mutedP_('With: ' + (r.people || '—') + (r.tags ? ' · Tags: ' + r.tags : '') + ' · ' + r.durationMin + ' min');
+    if (r.summary) b += '<p>' + h_(r.summary) + '</p>';
     const notes = notesText_(r.aiNotes);
-    if (notes) b.appendParagraph(notes).editAsText().setFontSize(10);
-    if (r.extNotes) b.appendParagraph(String(r.extNotes).slice(-4000)).editAsText().setFontSize(10);
-    (todosByConv[r.id] || []).forEach(function (t) {
-      b.appendListItem((t.status === 'done' ? '☑ ' : '☐ ') + t.title + (t.due ? ' (due ' + t.due + ')' : ''));
-    });
+    if (notes) b += notes.split('\n').map(function (l) { return '<p style="font-size:10pt">' + h_(l) + '</p>'; }).join('');
+    if (r.extNotes) b += '<p style="font-size:10pt">' + h_(String(r.extNotes).slice(-4000)).replace(/\n/g, '<br>') + '</p>';
+    const todos = todosByConv[r.id] || [];
+    if (todos.length) b += '<ul>' + todos.map(function (t) { return '<li>' + (t.status === 'done' ? '☑ ' : '☐ ') + h_(t.title + (t.due ? ' (due ' + t.due + ')' : '')) + '</li>'; }).join('') + '</ul>';
   });
-  doc.saveAndClose();
+  memoryDoc_(ctx, 'm' + month, 'Memory — ' + month + ' (' + label + ')', b);
 }
 
 function writeTimelineDoc_(ctx, rows) {
-  const D = DocumentApp;
-  const doc = memoryDoc_(ctx, 'timeline', 'Timeline — all conversations');
-  const b = doc.getBody();
-  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('Timeline of every conversation');
-  b.appendParagraph('Format: date time–end · category · with people · title · minutes. Newest first. Times in ' + ctx.tz + '.').editAsText().setForegroundColor('#64748b');
+  let b = '<h1>Timeline of every conversation</h1>' + mutedP_('Format: date time–end · category · with people · title · minutes. Newest first. Times in ' + ctx.tz + '.', 10);
   let month = '';
   rows.slice().reverse().forEach(function (r) {
-    if (r.date.slice(0, 7) !== month) {
-      month = r.date.slice(0, 7);
-      b.appendParagraph(month).setHeading(D.ParagraphHeading.HEADING2);
-    }
-    const p = b.appendParagraph(r.date + ' ' + r.time + '–' + r.endTime + ' · ' + r.category + ' · with ' + (r.people || '?') + ' · ' + r.title + ' · ' + r.durationMin + ' min');
-    p.editAsText().setFontSize(10);
-    if (r.docUrl) p.setLinkUrl(r.docUrl);
+    if (r.date.slice(0, 7) !== month) { month = r.date.slice(0, 7); b += '<h2>' + h_(month) + '</h2>'; }
+    const line = h_(r.date + ' ' + r.time + '–' + r.endTime + ' · ' + r.category + ' · with ' + (r.people || '?') + ' · ' + r.title + ' · ' + r.durationMin + ' min');
+    b += '<p style="font-size:10pt">' + (r.docUrl ? '<a href="' + h_(r.docUrl) + '">' + line + '</a>' : line) + '</p>';
   });
-  doc.saveAndClose();
+  memoryDoc_(ctx, 'timeline', 'Timeline — all conversations', b);
 }
 
 function writePeopleDoc_(ctx) {
-  const D = DocumentApp;
-  const doc = memoryDoc_(ctx, 'people', 'People directory');
-  const b = doc.getBody();
-  b.getChild(0).asParagraph().setHeading(D.ParagraphHeading.TITLE).setText('People I talk to');
+  let b = '<h1>People I talk to</h1>';
   ['Office', 'Personal', ''].forEach(function (cat) {
-    const list = ctx.people.rows.filter(function (p) { return (p.category || '') === cat && cat !== 'Ignore'; })
+    const list = ctx.people.rows.filter(function (p) { return (p.category || '') === cat; })
       .sort(function (a, b2) { return Number(b2.count) - Number(a.count); });
     if (!list.length) return;
-    b.appendParagraph(cat || 'Not yet classified').setHeading(D.ParagraphHeading.HEADING2);
-    list.forEach(function (p) {
-      b.appendListItem(p.name + ' — ' + p.count + ' conversations · first ' + p.firstSeen + ' · last ' + p.lastSeen + (p.notes ? ' · ' + p.notes : ''));
-    });
+    b += '<h2>' + h_(cat || 'Not yet classified') + '</h2><ul>' + list.map(function (p) {
+      return '<li>' + h_(p.name + ' — ' + p.count + ' conversations · first ' + p.firstSeen + ' · last ' + p.lastSeen + (p.notes ? ' · ' + p.notes : '')) + '</li>';
+    }).join('') + '</ul>';
   });
-  doc.saveAndClose();
+  memoryDoc_(ctx, 'people', 'People directory', b);
 }
 
 /* ─────────────────────────────── digest e-mail ──────────────────────────── */
@@ -1560,7 +1678,7 @@ function apiState_() {
   out.recent = rows.slice().sort(function (a, b) { return (b.date + b.time).localeCompare(a.date + a.time); }).slice(0, 8).map(slimConv_);
   out.dueSoon = ctx.todos.rows.filter(function (t) { return t.status === 'open' && t.due; })
     .sort(function (a, b) { return a.due.localeCompare(b.due); }).slice(0, 6).map(slimTodo_);
-  out.log = ctx.logT.rows.slice(0, 12);
+  out.log = ctx.logT.rows.slice(-12).reverse();
   return out;
 }
 
@@ -1729,7 +1847,7 @@ function markMemoryDirty_(months) {
 function refileConversation_(ctx, r) {
   const date = new Date(r.startIso || (r.date + 'T12:00:00Z'));
   const folder = monthFolder_(ctx, r.category, date);
-  [r.docId, r.audioId].filter(Boolean).forEach(function (id) { try { moveIfNeeded_(DriveApp.getFileById(id), folder); } catch (e) { /* gone */ } });
+  [r.docId, r.audioId].filter(Boolean).forEach(function (id) { try { moveIfNeeded_(driveItem_(id), folder); } catch (e) { /* gone */ } });
   ctx.todos.rows.filter(function (t) { return t.conversationId === r.id; }).forEach(function (t) { ctx.todos.upsert({ key: t.key, category: r.category }); });
 }
 
@@ -1944,24 +2062,19 @@ function claudeNotes_(ctx, info) {
   return claude_(system, user, { schema: NOTES_SCHEMA_, effort: 'low', maxTokens: 8000 });
 }
 
-function renderClaudeNotes_(body, ai) {
-  const D = DocumentApp;
-  body.appendParagraph('Claude notes').setHeading(D.ParagraphHeading.HEADING1);
+function claudeNotesHtml_(ai) {
+  let b = '<h2>Claude notes</h2>';
   (ai.sections || []).forEach(function (sec) {
     if (!sec.bullets || !sec.bullets.length) return;
-    body.appendParagraph(sec.title).setHeading(D.ParagraphHeading.HEADING3);
-    sec.bullets.forEach(function (b) { richText_(body.appendListItem(''), b); });
+    b += '<h3>' + h_(sec.title) + '</h3><ul>' + sec.bullets.map(function (x) { return '<li>' + mdInline_(x) + '</li>'; }).join('') + '</ul>';
   });
-  if ((ai.decisions || []).length) {
-    body.appendParagraph('Decisions').setHeading(D.ParagraphHeading.HEADING3);
-    ai.decisions.forEach(function (d) { richText_(body.appendListItem(''), d); });
-  }
+  if ((ai.decisions || []).length) b += '<h3>Decisions</h3><ul>' + ai.decisions.map(function (x) { return '<li>' + mdInline_(x) + '</li>'; }).join('') + '</ul>';
   if ((ai.myCommitments || []).length) {
-    body.appendParagraph('What I promised').setHeading(D.ParagraphHeading.HEADING3);
-    ai.myCommitments.forEach(function (c) { body.appendListItem('☐ ' + c.task + (c.toWhom ? ' — to ' + c.toWhom : '') + (c.due ? ' — by ' + c.due : '')); });
+    b += '<h3>What I promised</h3><ul>' + ai.myCommitments.map(function (c) {
+      return '<li>☐ ' + h_(c.task + (c.toWhom ? ' — to ' + c.toWhom : '') + (c.due ? ' — by ' + c.due : '')) + '</li>';
+    }).join('') + '</ul>';
   }
-  const cat = body.appendParagraph('Claude reads this as ' + ai.category + ': ' + ai.categoryReason);
-  cat.editAsText().setFontSize(9).setItalic(true).setForegroundColor('#64748b');
+  return b + '<p style="font-size:9pt;color:#64748b"><i>' + h_('Claude reads this as ' + ai.category + ': ' + ai.categoryReason) + '</i></p>';
 }
 
 function notesText_(json) {
@@ -2035,13 +2148,7 @@ function writeWeeklyReview_(ctx, email) {
     'Week ' + start + ' to ' + end + ' (' + ctx.tz + ').\n\nConversations:\n' + data + '\n\nOpen to-dos:\n' + (todos || 'none') + '\n\nPersonal contacts not heard from in 30+ days: ' + (quiet.join(', ') || 'none'),
     { effort: 'medium', maxTokens: 6000 });
   const title = 'Week in review — ' + start + ' to ' + end;
-  const doc = DocumentApp.create(title);
-  DriveApp.getFileById(doc.getId()).moveTo(folderPath_(ctx, [MEMORY_FOLDER, 'Weekly reviews']));
-  const b = doc.getBody();
-  b.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.TITLE).setText(title);
-  renderMarkdown_(b, text);
-  doc.saveAndClose();
-  const url = 'https://docs.google.com/document/d/' + doc.getId() + '/edit';
+  const url = upsertDoc_('', title, folderPath_(ctx, [MEMORY_FOLDER, 'Weekly reviews']), docHtml_(title, '<h1>' + h_(title) + '</h1>' + mdToHtml_(text))).getUrl();
   if (email) {
     MailApp.sendEmail({ to: Session.getEffectiveUser().getEmail(), subject: '🗓 ' + title, name: APP_NAME,
       htmlBody: '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:640px;color:#0f172a">' + mdToHtml_(text) +
@@ -2050,21 +2157,7 @@ function writeWeeklyReview_(ctx, email) {
   return { ok: true, url: url, message: 'Weekly review written' + (email ? ' and e-mailed' : '') };
 }
 
-function mdToHtml_(md) {
-  const esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
-  const inline = function (s) { return esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>'); };
-  let html = '', inList = false;
-  String(md).split(/\r?\n/).forEach(function (line) {
-    const t = line.trim();
-    const li = t.match(/^[-*•]\s+(.*)$/);
-    if (li) { if (!inList) { html += '<ul>'; inList = true; } html += '<li>' + inline(li[1]) + '</li>'; return; }
-    if (inList) { html += '</ul>'; inList = false; }
-    const h = t.match(/^(#{1,6})\s+(.*)$/);
-    if (h) html += '<h3 style="margin:18px 0 6px">' + inline(h[2]) + '</h3>';
-    else if (t) html += '<p>' + inline(t) + '</p>';
-  });
-  return html + (inList ? '</ul>' : '');
-}
+
 
 /* ─────────────────── no API key: send to the chat app you pay for ───────── */
 
@@ -2092,7 +2185,7 @@ function apiPromptFor_(args) {
   const r = ctx.conv.get(args.id);
   if (!r) throw new Error('Conversation not found');
   let docText = '';
-  try { docText = DocumentApp.openById(r.docId).getBody().getText(); } catch (e) { docText = r.summary; }
+  try { docText = docExport_(r.docId, 'text/plain'); } catch (e) { docText = r.summary; }
   const template = r.category === 'Personal' ? cfg.templatePersonal : cfg.templateOffice;
   const asks = {
     notes: 'Write structured notes about this conversation using these sections (leave a section out if nothing fits):\n' + template +
@@ -2130,38 +2223,20 @@ function apiSaveResult_(args) {
   }
   const stamp = fmt_(ctx, new Date(), 'yyyy-MM-dd HH:mm');
   if (args.kind === 'week' || !args.id) {
-    const doc = DocumentApp.create('Week in review — ' + fmt_(ctx, new Date(), 'yyyy-MM-dd') + ' (' + APP_LABELS_[app] + ')');
-    DriveApp.getFileById(doc.getId()).moveTo(folderPath_(ctx, [MEMORY_FOLDER, 'Weekly reviews']));
-    renderMarkdown_(doc.getBody(), text);
-    doc.saveAndClose();
-    return { ok: true, url: 'https://docs.google.com/document/d/' + doc.getId() + '/edit', ratings: ratings };
+    const title = 'Week in review — ' + fmt_(ctx, new Date(), 'yyyy-MM-dd') + ' (' + APP_LABELS_[app] + ')';
+    const f = upsertDoc_('', title, folderPath_(ctx, [MEMORY_FOLDER, 'Weekly reviews']), docHtml_(title, '<h1>' + h_(title) + '</h1>' + mdToHtml_(text)));
+    return { ok: true, url: f.getUrl(), ratings: ratings };
   }
   const r = ctx.conv.get(args.id);
   if (!r) throw new Error('Conversation not found');
-  const doc = DocumentApp.openById(r.docId);
-  const body = doc.getBody();
   const label = { notes: 'Notes', email: 'Follow-up e-mail draft', todos: 'Action items', transcribe: 'Transcript (rest)', ask: 'Answer' }[args.kind] || 'Notes';
   // Insert before the transcript so the doc reads summary → notes → transcript.
-  let at = body.getNumChildren();
-  for (let i = 0; i < body.getNumChildren(); i++) {
-    const el = body.getChild(i);
-    if (el.getType && el.getType() === DocumentApp.ElementType.PARAGRAPH && el.asParagraph().getText() === 'Transcript' &&
-        el.asParagraph().getHeading() === DocumentApp.ParagraphHeading.HEADING1) { at = i; break; }
-  }
-  const tmp = DocumentApp.create('tmp');
-  const tb = tmp.getBody();
-  tb.getChild(0).asParagraph().setHeading(DocumentApp.ParagraphHeading.HEADING1).setText(label + ' — from ' + APP_LABELS_[app] + ', ' + stamp);
-  renderMarkdown_(tb, text);
-  const n = tb.getNumChildren();
-  for (let i = 0; i < n; i++) {
-    const el = tb.getChild(i).copy();
-    const t = el.getType();
-    if (t === DocumentApp.ElementType.LIST_ITEM) body.insertListItem(at + i, el.asListItem());
-    else if (t === DocumentApp.ElementType.TABLE) body.insertTable(at + i, el.asTable());
-    else body.insertParagraph(at + i, el.asParagraph());
-  }
-  doc.saveAndClose();
-  DriveApp.getFileById(tmp.getId()).setTrashed(true);
+  const section = '<h2>' + h_(label + ' — from ' + APP_LABELS_[app] + ', ' + stamp) + '</h2>' + mdToHtml_(text);
+  let html = docExport_(r.docId, 'text/html');
+  const m = html.match(/<h[1-3][^>]*>(?:\s*<[^>]+>)*\s*Transcript\s*(?:<\/[^>]+>\s*)*<\/h[1-3]>/);
+  if (m) html = html.slice(0, m.index) + section + html.slice(m.index);
+  else html = html.indexOf('</body>') >= 0 ? html.replace('</body>', section + '</body>') : html + section;
+  upsertDoc_(r.docId, driveItem_(r.docId).getName(), driveItem_(driveItem_(r.docId).parents[0]), html);
   const ext = ((r.extNotes ? r.extNotes + '\n\n' : '') + label + ' (' + APP_LABELS_[app] + ', ' + stamp + '):\n' + text);
   ctx.conv.upsert({ id: r.id, extNotes: ext.length > 20000 ? ext.slice(-20000) : ext });
   markMemoryDirty_([r.date.slice(0, 7)]);
@@ -2309,6 +2384,21 @@ function parseTranscript_(text, name) {
     clock = start;
   });
   return out;
+}
+
+/** Dashboard Upload button: stores one file in the inbox folder (the only way files reach Life OS under drive.file). */
+function apiUploadToInbox_(args) {
+  const name = cleanText_(args.name, 180).replace(/[\/\\:*?"<>|]+/g, ' ').trim();
+  if (!name || !/\.(m4a|mp3|wav|aac|ogg|opus|flac|webm|mp4|mov|srt|vtt|txt|md)$/i.test(name)) throw new Error('Choose an audio file or a .srt, .vtt or .txt transcript');
+  const b64 = String(args.data || '');
+  if (!/^[A-Za-z0-9+/=]+$/.test(b64)) throw new Error('The file could not be read');
+  const bytes = Utilities.base64Decode(b64);
+  if (!bytes.length || bytes.length > INBOX_UPLOAD_MAX) throw new Error('Files must be under ' + Math.round(INBOX_UPLOAD_MAX / 1048576) + ' MB');
+  const ctx = openWorkspace_(getCfg_());
+  const type = inboxType_({ getMimeType: function () { return ''; }, getName: function () { return name; } }) || 'text/plain';
+  const f = folderPath_(ctx, [INBOX_FOLDER]).createFile({ getName: function () { return name; }, getContentType: function () { return type; }, getBytes: function () { return bytes; } });
+  log_(ctx, 'info', 'Uploaded to inbox: ' + name);
+  return { ok: true, name: name, size: bytes.length, id: f.getId() };
 }
 
 function inboxType_(f) {
@@ -2474,7 +2564,7 @@ function backupFolder_() {
 
 function backupSource_(source, label) {
   const folder = backupFolder_();
-  folder.createFile('PocketLifeOS ' + fmt_({ tz: 'Etc/UTC' }, new Date(), 'yyyy-MM-dd HHmm') + ' ' + label + '.js', source, MimeType.PLAIN_TEXT);
+  folder.createFile('PocketLifeOS ' + fmt_({ tz: 'Etc/UTC' }, new Date(), 'yyyy-MM-dd HHmm') + ' ' + label + '.js', source, 'text/plain');
   const files = [];
   const it = folder.getFiles();
   while (it.hasNext()) files.push(it.next());
@@ -2827,6 +2917,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
   <main><div class="wrap" id="view"></div></main>
 </div>
 <div class="toast" id="toast" hidden></div>
+<input type="file" id="upfile" multiple accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.aac,.ogg,.opus,.flac,.webm,.srt,.vtt,.txt,.md" hidden>
 <div class="sheet-bg" id="sheetbg" hidden><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheettitle" id="sheet"></div></div>
 
 <script>
@@ -2972,7 +3063,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     return '<div class="todo' + (t.status === 'done' ? ' done' : '') + '">' +
       '<button class="check' + (t.status === 'done' ? ' done' : '') + '" type="button" aria-label="' + (t.status === 'done' ? 'Reopen' : 'Mark done') + '" data-todo="' + esc(t.key) + '" data-done="' + (t.status === 'done' ? '1' : '') + '"></button>' +
       '<div><div class="t">' + esc(t.title) + '</div><div class="meta">' + chip(t.category) + (t.docUrl ? '<a href="' + esc(t.docUrl) + '" target="_blank" rel="noopener">' + esc(t.conversation) + '</a>' : '<span>' + esc(t.conversation) + '</span>') + '<span class="mono">' + esc(t.conversationDate) + '</span>' +
-      (t.source === 'Claude' ? '<span class="srcchip">you promised</span>' : t.source === 'phone' ? '<span class="srcchip">from phone</span>' : '') + (t.inTasks ? '<span>in Google Tasks</span>' : '') + (t.inCalendar ? '<span>on Calendar</span>' : '') + (t.priority ? '<span>' + esc(t.priority.toLowerCase()) + '</span>' : '') + '</div></div>' +
+      (t.source === 'Claude' ? '<span class="srcchip">you promised</span>' : t.source === 'phone' ? '<span class="srcchip">from phone</span>' : '') + (t.inTasks ? '<span>in Google Tasks</span>' : '') + (t.priority ? '<span>' + esc(t.priority.toLowerCase()) + '</span>' : '') + '</div></div>' +
       '<div class="due' + (late ? ' late' : '') + '">' + (t.due ? (late ? 'overdue ' : '') + esc(t.due) : '—') + '</div></div>';
   }
 
@@ -3078,7 +3169,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     var s = st.stats || {};
     var steps = [
       ['Connect Pocket', 'Paste your API key in Settings.', st.configured, 'settings'],
-      ['Turn on Google Tasks', 'In the script editor: Services (+) → Google Tasks API. Optional; without it to-dos go to a calendar.', st.health && st.health.tasks, ''],
+      ['Turn on Google Tasks', 'Comes with the appsscript.json manifest from the repo. Without it, to-dos stay in this dashboard and the sheet.', st.health && st.health.tasks, ''],
       ['Run the first sync', 'Pulls everything Pocket still holds. Big archives continue automatically every few minutes.', !!(st.lastSync && st.lastSync.ok), 'sync'],
       ['File the first conversations', 'Tell it who is Office and who is Personal. It learns and stops asking.', st.configured && s.conversations > 0 && s.unknownPeople === 0, 'review'],
       ['Connect Claude', 'Make a Claude Project that reads your archive.', !!(st.cfg && st.cfg.claudeDone), 'playbook']
@@ -3098,14 +3189,14 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     html += '<section class="stats">' +
       '<div class="stat"><span class="label">Conversations</span><b>' + (s.conversations || 0) + '</b><div class="split" title="Office / Personal / Unsorted"><i style="width:' + (100 * (s.office || 0) / total) + '%;background:var(--office)"></i><i style="width:' + (100 * (s.personal || 0) / total) + '%;background:var(--personal)"></i><i style="width:' + (100 * (s.unsorted || 0) / total) + '%;background:var(--unsorted)"></i></div></div>' +
       '<div class="stat"><span class="label">Hours recorded</span><b>' + (s.hours || 0) + '</b><span class="small faint">' + (s.office || 0) + ' office · ' + (s.personal || 0) + ' personal</span></div>' +
-      '<div class="stat"><span class="label">Open to-dos</span><b>' + (s.openTodos || 0) + '</b><span class="small faint">synced to ' + (st.cfg && st.cfg.todosTo === 'calendar' ? 'Calendar' : 'Google Tasks') + '</span></div>' +
+      '<div class="stat"><span class="label">Open to-dos</span><b>' + (s.openTodos || 0) + '</b><span class="small faint">' + (st.cfg && st.cfg.todosTo === 'off' ? 'kept here only' : 'synced to Google Tasks') + '</span></div>' +
       '<div class="stat' + ((s.unsorted + s.unknownPeople) ? ' attn' : '') + '"><span class="label">Needs your call</span><b>' + ((s.unsorted || 0) + (s.unknownPeople || 0)) + '</b><span class="small faint">' + (s.unsorted || 0) + ' talks · ' + (s.unknownPeople || 0) + ' people</span></div></section>';
     html += '<div class="grid2"><section class="panel"><div class="panel-h"><h2>Latest conversations</h2><button class="btn sm" type="button" data-go="talks">All</button></div><div class="list">' +
       ((st.recent || []).length ? st.recent.map(function (c) { return convRow(c, false); }).join('') : '<div class="empty">Nothing synced yet. Run a sync once your key is in.</div>') + '</div></section>' +
       '<section class="panel"><div class="panel-h"><h2>Due soon</h2><button class="btn sm" type="button" data-go="todos">All to-dos</button></div><div class="list">' +
       ((st.dueSoon || []).length ? st.dueSoon.map(todoRow).join('') : '<div class="empty">No dated to-dos open.</div>') + '</div>' +
       '<div class="panel-h" style="border-top:1px solid var(--line);border-bottom:0"><h3>Your archive</h3></div><div class="panel-b" style="padding-top:0"><div class="btns">' +
-      (st.links && st.links.root ? '<a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.root) + '">Drive folder</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.sheet) + '">Index sheet</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.memory) + '">Claude memory</a>' + (st.links.inbox ? '<a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.inbox) + '">Inbox (drop audio)</a>' : '') : '') +
+      (st.links && st.links.root ? '<a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.root) + '">Drive folder</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.sheet) + '">Index sheet</a><a class="btn sm" target="_blank" rel="noopener" href="' + esc(st.links.memory) + '">Claude memory</a>' + '<button class="btn sm primary" type="button" data-act="upload">Upload audio or transcripts</button>' : '') +
       '<a class="btn sm" target="_blank" rel="noopener" href="https://tasks.google.com/">Google Tasks</a></div></div></section></div>';
     if ((st.log || []).length) {
       html += '<section class="panel"><div class="panel-h"><h2>Activity</h2></div><div class="tbl"><table><tbody>' + st.log.slice(0, 8).map(function (l) {
@@ -3293,7 +3384,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       field('Only from', '<input type="date" id="backfillFrom" value="' + esc(c.backfillFrom) + '">', 'Leave empty to pull everything Pocket still has. On the Free plan Pocket keeps only 14 days, so this archive becomes your permanent copy.') +
       '</div></section>' +
       '<section class="panel"><div class="panel-h"><h2>To-dos</h2><span class="small muted">' + (st.health.tasks ? 'Google Tasks API is on' : 'Google Tasks API not added yet') + '</span></div><div class="panel-b form">' +
-      field('Send to-dos to', sel('todosTo', c.todosTo, [['tasks', 'Google Tasks (Gmail and Calendar sidebar)'], ['calendar', 'A “Pocket To-dos” calendar'], ['both', 'Both'], ['off', 'Nowhere, sheet only']])) +
+      field('Send to-dos to', sel('todosTo', c.todosTo === 'off' ? 'off' : 'tasks', [['tasks', 'Google Tasks (shows in Gmail and Calendar)'], ['off', 'Nowhere, keep them here']])) +
       field('Undated to-dos', sel('defaultDueDays', c.defaultDueDays, [[0, 'Leave undated'], [1, 'Schedule the next day'], [2, 'Schedule in 2 days'], [7, 'Schedule in a week']])) +
       field('Skip older than', '<div class="inline"><input type="number" id="todoMaxAgeDays" value="' + esc(c.todoMaxAgeDays) + '" min="0" style="width:90px"><span class="muted">days</span></div>', 'During the first full import, to-dos from older conversations stay in the sheet so your Tasks list is not flooded.') +
       field('Two-way', tog('pushCompletionToPocket', c.pushCompletionToPocket, 'When I finish a to-do in Google Tasks, close it in Pocket too')) +
@@ -3321,8 +3412,8 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       field('Personal template', '<textarea id="templatePersonal">' + esc(c.templatePersonal) + '</textarea>') +
       '</div></section>' +
       '<section class="panel"><div class="panel-h"><h2>Inbox and phone</h2></div><div class="panel-b form">' +
-      field('Drive inbox', tog('inbox', c.inbox, 'Send audio I drop in the inbox folder to Pocket') + (st.links.inbox ? '<a class="small" target="_blank" rel="noopener" href="' + esc(st.links.inbox) + '">Open the inbox folder</a>' : ''),
-        'Audio: Zoom or Teams exports, voice memos, files copied off the Pocket over USB (up to 48 MB each; your Pocket key needs recordings:write). Transcripts: .srt, .vtt or .txt from any app, filed directly with no Pocket. Give the audio the same name and it is kept alongside.' +
+      field('Uploads', '<div class="inline"><button class="btn sm primary" type="button" data-act="upload">Upload audio or transcripts</button>' + tog('inbox', c.inbox, 'Process uploads on each sync') + '</div>',
+        'Audio: Zoom or Teams exports, voice memos, files copied off the Pocket over USB (up to 30 MB each; your Pocket key needs recordings:write). Transcripts: .srt, .vtt or .txt from any app, filed with no Pocket. Upload the audio with the same name and it is kept alongside. Life OS can only see files it created, so uploads go through this button rather than straight into Drive.' +
         ((st.uploads || []).length ? '<br>Recent: ' + st.uploads.map(function (u) { return esc(u.name) + ' — ' + esc(u.status); }).join('; ') : '')) +
       field('Audio with no transcript', sel('inboxAudio', c.inboxAudio, [['pocket', 'Send it to Pocket to transcribe'], ['keep', 'Just archive it (I’ll transcribe elsewhere)']])) +
       field('Phone and webhook URL', '<input type="text" id="publicUrl" value="' + esc(c.publicUrl) + '" placeholder="https://script.google.com/macros/s/…/exec">', 'The URL of your second deployment (Who has access: Anyone). See Playbook → On your phone.') +
@@ -3432,7 +3523,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       ['Find and complete action items in Pocket', 'MCP search_pocket_actionitems, update_pocket_actionitem', 'yes', 'Two-way to-do sync'],
       ['Synthesised answers with sources', 'MCP query_pocket_meetings (Pro)', 'yes', 'Ask tab → Ask Pocket AI'],
       ['Near-instant updates', 'Webhooks: summary.completed and 12 more events', 'opt', 'Settings → Instant sync'],
-      ['Upload any audio for transcription (Zoom export, voice memo, USB backup)', 'POST /public/recordings/upload-url', 'yes', 'Drop files in the Drive inbox folder; they come back transcribed and filed'],
+      ['Upload any audio for transcription (Zoom export, voice memo, USB backup)', 'POST /public/recordings/upload-url', 'yes', 'Upload button in the dashboard; files come back transcribed and filed'],
       ['Change priority, due date, assignee of action items', 'MCP update_pocket_actionitem', 'idea', 'Re-prioritise from the To-dos tab'],
       ['Full transcripts by recency, cursor paging', 'MCP search_pocket_conversations', 'idea', 'Alternative pull path if REST rate limits bite'],
       ['Delete or rename recordings, custom templates, analytics', 'Organization API (admin key)', 'no', 'Needs a Pocket organisation. Useful only for a “pull then purge from Pocket” privacy setup.'],
@@ -3468,7 +3559,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
 
       '<section class="panel"><div class="panel-h"><h2>Connecting to the device directly</h2></div><div class="tbl"><table><thead><tr><th>Path</th><th>What it is</th><th>Use it?</th></tr></thead><tbody>' +
       '<tr><td><b>Wi-Fi Upload</b></td><td>The device uploads straight to Pocket cloud over your 2.4 GHz Wi-Fi. Needs firmware 1.8.5 or later; remembers 8 networks.</td><td><span class="status yes">Turn on</span><div class="small muted">Your phone is no longer needed in the chain. Device → cloud → Life OS.</div></td></tr>' +
-      '<tr><td><b>USB-C mass storage</b></td><td>In the app, enable USB Mode, then plug into the laptop. It mounts as a drive named <code>POCKET</code> with a <code>RECORD</code> folder of raw audio.</td><td><span class="status opt">Backup</span><div class="small muted">Copy RECORD into your Google Drive for desktop folder for an offline raw backup. To get transcripts, Life OS can upload those files to Pocket (ask me to add the Drive Inbox feature).</div></td></tr>' +
+      '<tr><td><b>USB-C mass storage</b></td><td>In the app, enable USB Mode, then plug into the laptop. It mounts as a drive named <code>POCKET</code> with a <code>RECORD</code> folder of raw audio.</td><td><span class="status opt">Backup</span><div class="small muted">Copy RECORD to your laptop for an offline raw backup. To get transcripts, use the dashboard’s Upload button and Life OS sends them to Pocket.</div></td></tr>' +
       '<tr><td><b>Wi-Fi Quick Transfer</b></td><td>The phone joins the device’s own hotspot. Up to 20× faster than Bluetooth.</td><td><span class="status yes">Use for long days</span><div class="small muted">Done from the Pocket app; nothing to build.</div></td></tr>' +
       '<tr><td><b>Bluetooth LE</b></td><td>Control channel for start and stop, settings, live streaming and normal sync.</td><td><span class="status no">No</span><div class="small muted">The protocol is private and undocumented, with no public reverse engineering. A custom app would break with firmware updates and could risk your warranty. The cloud API gives the same data reliably.</div></td></tr>' +
       '</tbody></table></div></section>' +
@@ -3565,7 +3656,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       '<li>In the Pocket app: Settings → Pocket Web Sync (USB Mode) → On.</li>' +
       '<li>Plug Pocket into your laptop, or into a USB-C phone, with a data cable. It appears as a drive called <code>POCKET</code> with a <code>RECORD</code> folder. On iPhone, look in the Files app under Locations. On Android, use the Files app.</li>' +
       '<li>Copy the recordings off. To transcribe on the device itself with no cloud, use a free Whisper app: <b>Aiko</b> on iPhone and Mac, <b>Buzz</b> on Windows, Mac or Linux. Export the transcript as .srt or .txt.</li>' +
-      '<li>When you are back online, drop the transcript (and the audio, with the same name) into the inbox folder. Life OS files it with the right date, and Send to and your Claude Project work on it like any other conversation.</li></ol>' +
+      '<li>When you are back online, open this dashboard and press <b>Upload audio or transcripts</b>. Choose the transcript, and the audio with the same name. Life OS files it with the right date, and Send to and your Claude Project work on it like any other conversation.</li></ol>' +
       '<p class="small muted">Two things to check on your device. Pocket does not document the format of the files in RECORD. If they are standard audio (WAV, MP3, M4A, Opus), everything above works. If they are a Pocket-only format, use Pocket Web Sync or Wi-Fi instead and tell me the file extension. USB Mode is switched on from the Pocket app over Bluetooth, so the phone app is needed once per session. Wi-Fi Quick Transfer moves files into the Pocket app only; it does not give you the files themselves.</p></div></section>';
   }
 
@@ -3583,7 +3674,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       '<li><b>Claude app with your Life OS project.</b> The best way to ask your memory anything, including in voice mode while walking or driving.</li>' +
       '<li><b>Google Tasks and Gmail.</b> Your to-dos and the evening e-mail.</li>' +
       '<li><b>This dashboard.</b> Open its link in Safari or Chrome → Share → Add to Home Screen. It opens like an app.</li>' +
-      '<li><b>Google Drive.</b> To transcribe any audio, such as a WhatsApp voice note, a voice memo or a call recording: Share → Drive → the <i>' + esc(c.rootFolderName) + ' / _Inbox</i> folder. It comes back transcribed and filed.</li></ul>' +
+      '<li><b>Uploads from your phone.</b> To transcribe any audio, such as a WhatsApp voice note, a voice memo or a call recording: save it to Files, open this dashboard and press <b>Upload audio or transcripts</b>. It comes back transcribed and filed.</li></ul>' +
       '<p><b>One-tap shortcuts.</b> First, one-time: in the script editor, Deploy → New deployment → Web app → Execute as <b>Me</b>, Who has access <b>Anyone</b>. Paste that URL into Settings → Phone and webhook URL. Then build these in the iPhone <b>Shortcuts</b> app, or in the free <b>HTTP Shortcuts</b> app on Android:</p></div>' +
       '<div class="tbl"><table><thead><tr><th>Shortcut</th><th>URL and steps</th></tr></thead><tbody>' +
       recipe('Ask my memory', 'ask', 'Dictate Text → ', 'key <code>q</code> = Dictated Text', 'Speak Text (Contents of URL). Say “Hey Siri, Ask my memory”.') +
@@ -3617,6 +3708,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     if (act) {
       var a = act.getAttribute('data-act');
       if (a === 'sync') doSync(act);
+      if (a === 'upload') { $('#upfile').click(); }
       if (a === 'exit-demo') { demo = false; refreshState().then(function () { go('home'); }); }
       if (a === 'enter-demo') { demo = true; refreshState().then(function () { go('home'); }); }
       return;
@@ -3673,6 +3765,30 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
     }
   });
   function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+  $('#upfile').addEventListener('change', function () {
+    var files = Array.prototype.slice.call(this.files || []);
+    this.value = '';
+    var MAX = 30 * 1024 * 1024, done = 0, failed = [];
+    function next() {
+      if (!files.length) {
+        toast(done + ' file' + (done === 1 ? '' : 's') + ' uploaded' + (failed.length ? '. Not uploaded: ' + failed.join(', ') : '') + (done ? '. They are processed on the next sync, or press Sync now.' : ''), 7000);
+        if (done) refreshState().then(function () { if (S.view === 'home' || S.view === 'settings') go(S.view); });
+        return;
+      }
+      var f = files.shift();
+      if (f.size > MAX) { failed.push(f.name + ' (over 30 MB)'); next(); return; }
+      toast('Uploading ' + f.name + '…', 60000);
+      var reader = new FileReader();
+      reader.onload = function () {
+        var data = String(reader.result).split(',')[1] || '';
+        call('uploadToInbox', { name: f.name, data: data }).then(function () { done++; next(); })
+          .catch(function (e) { failed.push(f.name + ' (' + (e && e.message ? e.message : e) + ')'); next(); });
+      };
+      reader.onerror = function () { failed.push(f.name); next(); };
+      reader.readAsDataURL(f);
+    }
+    next();
+  });
   $('#syncbtn').addEventListener('click', function () { doSync(this); });
   $('#msync').addEventListener('click', function () { doSync(this); });
 
@@ -3714,7 +3830,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       ['t11', 'Send Meera the 3-year pricing table (promised to Meera Shah)', d(-2), 'open', '', 'Office', 'c3', 'Claude']
     ].map(function (t) {
       var c = convs.filter(function (x) { return x.id === t[6]; })[0];
-      return { source: t[7] || '', key: t[0], title: t[1], due: t[2], status: t[3], priority: t[4], category: t[5], conversation: c.title, conversationDate: c.date, docUrl: c.docUrl, inTasks: true, inCalendar: false };
+      return { source: t[7] || '', key: t[0], title: t[1], due: t[2], status: t[3], priority: t[4], category: t[5], conversation: c.title, conversationDate: c.date, docUrl: c.docUrl, inTasks: true };
     });
     var cfg = { rootFolderName: 'Life OS — Conversations', timezone: 'Asia/Kolkata', myNames: 'Me', syncEveryMinutes: 15, saveAudio: true, saveTranscript: true, todosTo: 'tasks', defaultDueDays: 1, todoMaxAgeDays: 14,
       pushCompletionToPocket: true, dailyDigest: true, digestHour: 20, mixedRule: 'office', aiModel: 'claude-opus-5-5', aiNotes: true, aiCommitments: true, aiAutoFile: false, weeklyReview: true, weeklyDay: 'SUNDAY', weeklyHour: 18, aiMaxAgeDays: 30,
@@ -3800,6 +3916,7 @@ pre.copy { white-space: pre-wrap; font-family: var(--font-mono); font-size: .8re
       claudePrompt: function (a) { return { prompt: 'Answer my question using only the records of my recorded conversations below…\\n\\nQuestion: ' + a.question + '\\n\\n## Most relevant conversations\\n### ' + convs[2].date + ' ' + convs[2].time + ' · Office · ' + convs[2].title + '\\n' + convs[2].summary }; },
       testClaude: function () { return { ok: true, reply: 'OK' }; },
       weeklyReview: function () { return { ok: true, message: 'Sample mode: no review written' }; },
+      uploadToInbox: function (a) { return { ok: true, name: a.name, size: Math.round(a.data.length * 0.75) }; },
       promptFor: function (a) {
         var c = convs.filter(function (x) { return x.id === a.id; })[0];
         if (a.kind === 'week' || !c) return { kind: 'week', title: 'This week', prompt: 'Write my weekly review from the records of my recorded conversations below…\\n\\n' + convs.slice(0, 5).map(function (x) { return '- ' + x.date + ' ' + x.title + ': ' + x.summary; }).join('\\n') };
