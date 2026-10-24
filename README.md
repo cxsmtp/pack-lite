@@ -11,6 +11,9 @@ One file — [`PocketLifeOS.gs`](PocketLifeOS.gs) — that runs inside your own 
 - Runs every 15 minutes in Google's cloud, so your laptop and phone can be off.
 - **Drive inbox**: drop any audio file (Zoom export, voice memo, USB copy from the device, up to 48 MB) into `_Inbox — drop audio here`. It is sent to Pocket for transcription and comes back filed.
 - **Optional Claude API key** (replaces Pocket Pro): Claude notes from your own Office/Personal templates, a choice of Opus/Sonnet/Haiku, Ask across your whole archive, a weekly review, and the promises you made turned into to-dos.
+- **No API keys needed**: every conversation has *Send to Claude / ChatGPT / Gemini / Gemini in Docs*. It copies the transcript and your template, then opens the app you already pay for. Paste the answer back, rate it, and pick your favourite.
+- **Long recordings**: audio of any length is saved to Drive, resuming across runs. Conversations where Pocket's transcript stops early are flagged, with a *Transcribe the rest* action.
+- **Offline import**: copy recordings off the device over USB-C (USB Mode), transcribe on-device with a Whisper app, and drop the `.srt`/`.vtt`/`.txt` (plus the audio, with the same name) into the inbox. It is filed without Pocket.
 - **Phone shortcuts** (iPhone Shortcuts, Android HTTP Shortcuts): *Ask my memory*, *Add to-do*, *Status*, *Sync now*.
 
 The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project setup and step-by-step phone shortcut recipes.
