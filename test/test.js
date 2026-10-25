@@ -106,7 +106,6 @@ ok(r4s.created === 1, 'webhook-forced r4 processed');
 const dg = A.api('sendDigest');
 ok(dg.sent && /talks/.test(H.G.__mail.subject), 'digest mail: ' + H.G.__mail.subject);
 const fs = require('fs');
-if (process.env.UI_OUT) fs.writeFileSync(process.env.UI_OUT, A.UI_HTML_());
 console.log('\nALL PASSED');
 
 console.log('\n--- v2: Claude, inbox, phone ---');
@@ -234,7 +233,7 @@ console.log('\n--- v4: auto-update with integrity checks, token hardening ---');
 const src = fs.readFileSync(H.SCRIPT_PATH, 'utf8');
 const gh = H.gh;
 const SHA = (c) => c.repeat(40);
-gh.files[0].source = src.replace("const APP_VERSION = '2.0.0';", "const APP_VERSION = '0.9.0';");
+gh.files[0].source = src.replace("const APP_VERSION = '2.1.0';", "const APP_VERSION = '0.9.0';");
 gh.file = src;
 const chk = A.api('checkUpdate', {});
 ok(chk.latest === SHA('a') && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
@@ -253,7 +252,7 @@ ok(bk && Object.values(H.items).some(i => i.parent === bk.id && i.text && /0\.9\
 ok(A.api('checkUpdate', {}).upToDate, 'up to date after install');
 let threw = '';
 // tampered download: served file differs from the one release.json describes
-gh.head.sha = SHA('b'); gh.file = src.replace("'2.0.0'", "'2.0.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
+gh.head.sha = SHA('b'); gh.file = src.replace("'2.1.0'", "'2.1.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Integrity check failed/.test(threw) && gh.files[0].source === src, 'tampered code refused (SHA-256 mismatch)');
 delete gh.served;
@@ -273,13 +272,13 @@ ok(/truncated/.test(threw), 'truncated download refused');
 gh.head.sha = 'not-a-sha';
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Unexpected commit id/.test(threw), 'malformed commit id refused');
-gh.head.sha = SHA('c'); gh.file = src.replace("'2.0.0'", "'2.0.1'");
+gh.head.sha = SHA('c'); gh.file = src.replace("'2.1.0'", "'2.1.1'");
 ok(A.api('checkUpdate', { install: true }).applied, 'next verified update installs');
 // rollback
 const rb = A.api('rollback');
 ok(rb.applied && gh.files[0].source === src, 'rollback restores the previous code');
 // API switched off
-gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.0.0'", "'2.0.2'");
+gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.1.0'", "'2.1.2'");
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;
@@ -411,3 +410,115 @@ A.resetPin();
 ok(!A.api('pinStatus').enabled && A.api('state').cfg, 'resetPin from the editor removes it');
 ok(H.log.some(l => /Life OS PIN removed/.test(l)), 'reset logged');
 console.log('\nALL V8 PASSED');
+
+console.log('\n--- v9: Ideas category ---');
+const nowIso = new Date().toISOString();
+H.recordings.push(
+  { id: 'r_idea1', title: 'Shower thought', state: 'completed', duration: 120, recording_at: nowIso, created_at: nowIso, updated_at: nowIso, folder_id: null, tags: [{ id: 'ti', name: 'Ideas', color: 'x' }],
+    speakers: {}, transcript: { segments: [{ start: 0, end: 5, speaker: 'SPEAKER_00', text: 'A tiny app.' }] }, summarizations: { s: { processingStatus: 'completed', v2: { summary: { markdown: 'A tiny app idea.' } } } } },
+  { id: 'r_idea2', title: 'Walk notes', state: 'completed', duration: 180, recording_at: nowIso, created_at: nowIso, updated_at: nowIso, folder_id: null, tags: [],
+    speakers: {}, transcript: { segments: [{ start: 0, end: 5, speaker: 'SPEAKER_00', text: 'What if we built a prototype?' }] }, summarizations: { s: { processingStatus: 'completed', v2: { summary: { markdown: 'Brainstorm: what if a side project prototype for voice budgeting.' } } } } }
+);
+A.api('saveSettings', { cfg: { rules: 'office: standup, sprint\npersonal: mom, family\nideas: idea, brainstorm, what if, side project, prototype', lookbackDays: 30 } });
+A.api('sync');
+const ideas = A.api('conversations', { category: 'Ideas', limit: 50 }).rows;
+ok(ideas.some(r => r.title === 'Shower thought' && r.categorySource === 'tag'), 'Pocket tag "Ideas" files to Ideas: ' + JSON.stringify(ideas.map(r => [r.title, r.categorySource])));
+ok(ideas.some(r => r.title === 'Walk notes' && r.categorySource === 'keywords'), 'ideas keywords file to Ideas');
+ok(Object.values(H.items).some(i => i.kind === 'folder' && i.name === 'Ideas'), 'Ideas folder created in Drive');
+ok(A.api('state').stats.ideas >= 2, 'stats count Ideas');
+const anyConv = A.api('conversations', { q: 'Coffee with Sana', limit: 5 }).rows[0];
+A.api('classifyConversation', { id: anyConv.id, category: 'Ideas', rememberPeople: true });
+ok(A.api('conversations', { q: 'Coffee with Sana', limit: 5 }).rows[0].category === 'Ideas', 'conversation moved to Ideas by hand');
+ok(!A.api('people').some(p => p.category === 'Ideas'), 'people are never marked Ideas');
+threw = ''; try { A.api('classifyConversation', { id: anyConv.id, category: 'Shopping' }); } catch (e) { threw = e.message; }
+ok(/Bad category/.test(threw), 'unknown categories still refused');
+console.log('\nALL V9 PASSED');
+
+console.log('\n--- v10: delete a conversation or a to-do everywhere ---');
+const mom = A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows[0];
+const momRow = Object.values(H.sheets)[0].getSheetByName('Conversations').data.find(r => r[0] === mom.id);
+const momTodos = A.api('todos', { status: 'all' }).filter(t => t.conversation === mom.title);
+const taskIds = Object.values(H.taskStore.tasks).filter(t => /Book train tickets/.test(t.title)).map(t => t.id);
+ok(mom && momRow && momTodos.length && taskIds.length, 'test conversation has a doc, sheet row, to-dos and a Google Task');
+const docItem = Object.values(H.items).find(i => i.kind === 'file' && /Call with Mom/.test(i.name) && !i.trashed && i.mime === H.GDOC);
+const del = A.api('deleteConversation', { id: mom.id });
+ok(del.ok && del.todos === momTodos.length, 'delete reports what it removed: ' + JSON.stringify(del));
+ok(docItem && docItem.trashed, 'conversation doc moved to the Drive bin');
+ok(!A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows.length, 'gone from the dashboard');
+ok(!Object.values(H.sheets)[0].getSheetByName('Conversations').data.some(r => r && r[0] === mom.id), 'row removed from the index sheet');
+ok(!A.api('todos', { status: 'all' }).some(t => t.conversation === mom.title), 'its to-dos removed');
+ok(taskIds.every(id => !H.taskStore.tasks[id]), 'its Google Tasks removed');
+ok(!JSON.stringify(H.store.st_memoryDirty || '').includes('false') || JSON.parse(H.store.st_memoryDirty).months.length >= 1, 'memory docs marked for rewrite');
+const convSheetData = Object.values(H.sheets)[0].getSheetByName('Conversations').data;
+const nextConv = A.api('conversations', { limit: 50 }).rows[0];
+A.api('classifyConversation', { id: nextConv.id, category: 'Personal' });
+const after = Object.values(H.sheets)[0].getSheetByName('Conversations').data.find(r => r && r[0] === nextConv.id);
+ok(after && after[7] === 'Personal', 'rows below the deleted one still update the right sheet row');
+A.api('sync');
+ok(!A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows.length, 'the next sync does not bring it back from Pocket');
+threw = ''; try { A.api('deleteConversation', { id: mom.id }); } catch (e) { threw = e.message; }
+ok(/not found/.test(threw), 'deleting twice is refused cleanly');
+const someTodo = A.api('todos', { status: 'all' })[0];
+ok(A.api('deleteTodo', { key: someTodo.key }).ok && !A.api('todos', { status: 'all' }).some(t => t.key === someTodo.key), 'a single to-do can be deleted');
+A.api('sync');
+ok(!A.api('todos', { status: 'all' }).some(t => t.key === someTodo.key), 'a deleted to-do stays deleted after sync');
+console.log('\nALL V10 PASSED');
+
+console.log('\n--- v11: dashboard speed (Google API calls per tap) ---');
+A.api('sync');                       // a full open saves the folder and sheet layout
+let g0 = H.calls.google; A.api('state'); const stateCalls = H.calls.google - g0;
+g0 = H.calls.google; A.api('todos', { status: 'open' }); const todoCalls = H.calls.google - g0;
+g0 = H.calls.google; A.api('conversations', { limit: 20 }); const convCalls = H.calls.google - g0;
+ok(stateCalls <= 1 && todoCalls <= 1 && convCalls <= 1, 'one Google call per dashboard read: state ' + stateCalls + ', to-dos ' + todoCalls + ', conversations ' + convCalls);
+ok(A.api('state').pin && A.api('state').links.root, 'state carries the PIN status and the saved links');
+const savedRoot = JSON.parse(H.store.st_rootId);
+H.store.st_sheetTabs = JSON.stringify({ Conversations: 999 });   // stale layout, e.g. a tab deleted by hand
+ok(A.api('state').stats.conversations > 0, 'falls back to the full check when the saved layout is stale');
+ok(JSON.parse(H.store.st_sheetTabs).People !== undefined && JSON.parse(H.store.st_rootId) === savedRoot, 'layout re-saved after the full check');
+console.log('\nALL V11 PASSED');
+
+console.log('\n--- v12: one request per tap (bundle, settings read once) ---');
+let p0 = H.calls.props; g0 = H.calls.google;
+const bun = A.api('bundle');
+ok(H.calls.google - g0 <= 1, 'bundle reads the index sheet once (' + (H.calls.google - g0) + ' Google call)');
+ok(H.calls.props - p0 === 1, 'settings read once per request (' + (H.calls.props - p0) + ')');
+ok(bun.state.stats && Array.isArray(bun.todos) && bun.conversations.rows && bun.review.people && Array.isArray(bun.people), 'bundle carries state, to-dos, conversations, review and people');
+const openTodo = bun.todos[0];
+const done12 = A.api('completeTodo', { key: openTodo.key, _bundle: true });
+ok(done12.__result && done12.__bundle && !done12.__bundle.todos.some(function (t) { return t.key === openTodo.key; }), 'a change can return the refreshed pages in the same reply');
+ok(A.api('todos', { status: 'all' }).filter(function (t) { return t.key === openTodo.key; })[0].status === 'done', 'the change itself was saved');
+A.api('completeTodo', { key: openTodo.key, reopen: true });
+ok(!H.store.st_jobs || JSON.parse(H.store.st_jobs).names.indexOf('webhookSync') < 0, 'job list leaves out the one-off webhook job');
+const t12 = H.triggers.length; H.triggers.push('extraJob');
+ok(A.api('state').health.triggers.indexOf('extraJob') < 0, 'job list is reused for a few minutes');
+H.G.advance(11 * 60000);
+ok(A.api('state').health.triggers.indexOf('extraJob') >= 0, 'job list refreshed after 10 minutes');
+H.triggers.splice(t12, 1);
+const set12 = A.api('pinSet', { pin: '1357' });
+threw = ''; try { A.api('bundle'); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'bundle needs the PIN like every other page');
+ok(!A.api('pinStatus', { _bundle: true }).__bundle, 'locked actions never attach the pages');
+A.api('pinClear', { current: '1357', _pin: set12.token });
+ok(A.api('state').pin.enabled === false, 'PIN cleared again');
+console.log('\nALL V12 PASSED');
+
+console.log('\n--- v13: security fixes from review ---');
+const set13 = A.api('pinSet', { pin: '8642' });
+// Simulate a burst of guesses: this request's settings copy says "no wrong tries", storage says 4 already.
+H.store.st_pinLock = JSON.stringify({ fails: 4, until: 0, strikes: 0 });
+const realProps = PropertiesService.getUserProperties(), realGetAll = realProps.getProperties;
+realProps.getProperties = function () { const all = realGetAll(); all.st_pinLock = JSON.stringify({ fails: 0, until: 0, strikes: 0 }); return all; };
+threw = ''; try { A.api('pinUnlock', { pin: '0000' }); } catch (e) { threw = e.message; }
+realProps.getProperties = realGetAll;
+ok(/Too many wrong PINs/.test(threw), 'wrong-PIN counter is read under the lock, so parallel guesses still trip it: ' + threw);
+H.G.advance(6 * 60000);
+const un13 = A.api('pinUnlock', { pin: '8642' });
+A.api('pinClear', { current: '8642', _pin: un13.token });
+ok(!A.api('state').pin.enabled, 'right PIN still works after the lock expires');
+const rm = Object.keys(H.store).filter(k => /^st_removedConversations_\d+$/.test(k));
+ok(rm.length >= 1 && rm.every(k => H.store[k].length < 9000), 'delete list split into properties under the 9 KB limit');
+ok(!H.store.st_removedConversations && !rm.some(k => H.store[k].indexOf(mom.id) >= 0), 'deleted IDs are stored only as hashes');
+const before13 = A.api('conversations', { limit: 500 }).total;
+A.api('sync');
+ok(A.api('conversations', { limit: 500 }).total === before13 && !A.api('conversations', { limit: 500 }).rows.some(r => r.id === mom.id), 'deleted conversation still never comes back');
+console.log('\nALL V13 PASSED');

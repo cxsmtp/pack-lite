@@ -40,9 +40,11 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 
 - **Search everything:** press `⌘K` (Mac) or `Ctrl K` (Windows), or `/`, or tap the magnifier on your phone. It finds conversations, to-dos, people, any setting and any docs page, and runs actions like Sync, Upload or switching theme.
 - **PIN lock (optional):** Settings → Security. Asked when you open Life OS and after the idle time you pick; the server refuses every action until it is entered. Five wrong tries lock it (5 min, then longer) and e-mail you. Forgot it? Run `resetPin` in the script editor.
+- **Delete:** open a conversation → Delete (or the bin icon on a to-do). Its doc and audio go to the Drive bin, its rows leave the index sheet, its to-dos leave Google Tasks, the memory docs are rewritten without it, and later syncs never import it again. Pocket keeps its own copy until you delete it in the Pocket app.
 - **Themes:** Light, Dim, Dark or Auto, from the top bar or Settings → Appearance.
 - **Version:** shown next to the Life OS name at the top. Click it to open Settings → Updates.
-- **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Office or Personal, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
+- **Categories:** Office, Personal, Ideas (brainstorms and thinking aloud) and Unsorted. A Pocket tag named "Ideas", the `ideas:` keyword rule, a Pocket folder mapping or Claude can file a conversation under Ideas; each category gets its own Drive folder and notes template.
+- **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Filing, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
 
 ## On your phone
 
