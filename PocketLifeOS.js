@@ -303,6 +303,7 @@ function api(action, args) {
   const pinToken = args._pin;
   delete args._pin;
   if (PIN_OPEN_ACTIONS.indexOf(action) < 0 && !pinCheckSession_(pinToken)) throw new Error('LOCKED');
+  QUICK_OPEN_ = action !== 'sync';
   const handlers = {
     pinStatus: apiPinStatus_,
     pinUnlock: apiPinUnlock_,
@@ -367,8 +368,8 @@ function pinCheckSession_(token) {
   const h = sha256Hex_(token), list = pinSessions_();
   const hit = list.filter(function (x) { return safeEqual_(x.h, h); })[0];
   if (!hit) return false;
-  hit.exp = Date.now() + pinIdleMs_();
-  setState_('pinSessions', list);
+  const exp = Date.now() + pinIdleMs_();
+  if (exp - hit.exp > Math.min(60000, pinIdleMs_() / 4)) { hit.exp = exp; setState_('pinSessions', list); }
   return true;
 }
 function pinNewSession_() {
@@ -856,7 +857,10 @@ function sheetRange_(name, a1) { return encodeURIComponent("'" + name.replace(/'
 /** Opens (or creates) the index spreadsheet and loads every table in two API calls. */
 function openIndex_(ctx, specs) {
   let id = getState_('sheetId', '');
-  if (id) { try { driveItem_(id); } catch (e) { id = ''; } }
+  const savedTabs = getState_('sheetTabs', null);
+  if (ctx.quick) {
+    if (!id || !savedTabs || specs.some(function (s) { return savedTabs[s.name] === undefined; })) throw new Error('No saved sheet layout yet');
+  } else if (id) { try { driveItem_(id); } catch (e) { id = ''; } }
   if (!id) {
     const created = gapi_('post', SHEETS_API, { json: { properties: { title: 'Life OS — Index' },
       sheets: specs.map(function (s) { return { properties: { title: s.name, gridProperties: { frozenRowCount: 1 } } }; }) } });
@@ -864,15 +868,19 @@ function openIndex_(ctx, specs) {
     driveItem_(id).moveTo(ctx.root);
     setState_('sheetId', id);
   }
-  const meta = gapi_('get', SHEETS_API + '/' + id + '?fields=sheets.properties(sheetId,title)');
   const have = {};
-  (meta.sheets || []).forEach(function (s) { have[s.properties.title] = s.properties.sheetId; });
+  if (ctx.quick) Object.assign(have, savedTabs);
+  else {
+    const meta = gapi_('get', SHEETS_API + '/' + id + '?fields=sheets.properties(sheetId,title)');
+    (meta.sheets || []).forEach(function (s) { have[s.properties.title] = s.properties.sheetId; });
+  }
   const missing = specs.filter(function (s) { return have[s.name] === undefined; });
   if (missing.length) {
     const r = gapi_('post', SHEETS_API + '/' + id + ':batchUpdate', { json: { requests: missing.map(function (s) {
       return { addSheet: { properties: { title: s.name, gridProperties: { frozenRowCount: 1 } } } }; }) } });
     (r.replies || []).forEach(function (rep, i) { have[missing[i].name] = rep.addSheet.properties.sheetId; });
   }
+  if (!ctx.quick) setState_('sheetTabs', have);
   const got = gapi_('get', SHEETS_API + '/' + id + '/values:batchGet?majorDimension=ROWS&' +
     specs.map(function (s) { return 'ranges=' + sheetRange_(s.name, 'A1:' + colLetter_(s.cols.length)); }).join('&'));
   const ss = { id: id, sheetIds: have, getUrl: function () { return 'https://docs.google.com/spreadsheets/d/' + id + '/edit'; } };
@@ -987,10 +995,21 @@ const UPLOAD_COLS = [['fileId', 'Drive file ID'], ['name', 'File'], ['size', 'By
   ['uploadedAt', 'Uploaded'], ['recordingId', 'Pocket ID'], ['status', 'Status']];
 const LOG_COLS = [['time', 'Time'], ['level', 'Level'], ['message', 'Message']];
 
+// Dashboard requests trust the folder and sheet IDs saved by the last sync instead of re-checking them,
+// which turns about five Google API calls per tap into one. Syncs, setup and triggers always check.
+let QUICK_OPEN_ = false;
 function openWorkspace_(cfg) {
-  const ctx = { cfg: cfg, tz: cfg.timezone, folderCache: {}, dirtyMonths: {}, peopleDirty: false,
+  if (QUICK_OPEN_) {
+    try { return openWorkspaceWith_(cfg, true); } catch (e) { /* something moved or was deleted: do the full check */ }
+  }
+  return openWorkspaceWith_(cfg, false);
+}
+function openWorkspaceWith_(cfg, quick) {
+  const ctx = { cfg: cfg, tz: cfg.timezone, folderCache: {}, dirtyMonths: {}, peopleDirty: false, quick: quick,
     stats: { listed: 0, processed: 0, created: 0, updated: 0, todos: 0, audio: 0, errors: 0, skipped: 0 }, errors: [] };
-  ctx.root = getOrCreateRoot_(cfg);
+  const rootId = quick ? getState_('rootId', '') : '';
+  if (quick && !rootId) throw new Error('No saved folder yet');
+  ctx.root = quick ? new DItem_({ id: rootId, name: cfg.rootFolderName, mimeType: FOLDER_MIME }) : getOrCreateRoot_(cfg);
   const t = openIndex_(ctx, [
     { key: 'conv', name: 'Conversations', cols: CONV_COLS }, { key: 'people', name: 'People', cols: PEOPLE_COLS },
     { key: 'todos', name: 'To-dos', cols: TODO_COLS }, { key: 'logT', name: 'Log', cols: LOG_COLS },
@@ -1845,10 +1864,13 @@ function apiState_() {
     update: { repo: UPDATE_REPO, branch: UPDATE_BRANCH, installed: getState_('installedSha', ''), check: getState_('updateCheck', null), last: getState_('lastUpdate', null), hasToken: !!getGithubToken_() }
   };
   const ctx = openWorkspace_(cfg);
-  out.links.root = ctx.root.getUrl();
-  out.links.sheet = ctx.ss.getUrl();
-  out.links.memory = memoryFolder_(ctx).getUrl();
-  out.links.inbox = folderPath_(ctx, [INBOX_FOLDER]).getUrl();
+  let links = getState_('links', null);
+  if (!links || !ctx.quick || links.root !== ctx.root.getUrl()) {
+    links = { root: ctx.root.getUrl(), sheet: ctx.ss.getUrl(), memory: memoryFolder_(ctx).getUrl(), inbox: folderPath_(ctx, [INBOX_FOLDER]).getUrl() };
+    setState_('links', links);
+  }
+  Object.assign(out.links, links);
+  out.pin = apiPinStatus_();
   out.uploads = ctx.uploads.rows.slice(-5).reverse();
   const rows = ctx.conv.rows;
   out.stats = {
@@ -3409,10 +3431,31 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         google.script.run.withSuccessHandler(res).withFailureHandler(function (e) { rej(e && e.message ? e : new Error(String(e))); }).api(action, args);
       });
     return p.catch(function (e) {
-      if (e && /LOCKED/.test(e.message)) { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); e = new Error('Locked. Enter your PIN.'); }
+      if (e && /LOCKED/.test(e.message) && S.state) { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); e = new Error('Locked. Enter your PIN.'); }
       throw e;
     });
   }
+
+  /* ---------- instant pages: show the last answer straight away, then refresh it ---------- */
+  var MEM = {}, SLOT = {};
+  function fresh(slot, action, args, render, onErr) {
+    var key = action + ':' + JSON.stringify(args || {});
+    SLOT[slot] = key;
+    var hit = MEM[key];
+    if (hit) render(hit, true);
+    return call(action, args).then(function (r) {
+      MEM[key] = r;
+      if (SLOT[slot] !== key) return;                    // you moved on to something else
+      if (!hit || JSON.stringify(hit) !== JSON.stringify(r)) render(r, false);
+    }).catch(function (e) { if (SLOT[slot] === key && !hit && onErr) onErr(e); });
+  }
+  function prefetch(action, args) {
+    var key = action + ':' + JSON.stringify(args || {});
+    if (!MEM[key]) call(action, args).then(function (r) { if (!MEM[key]) MEM[key] = r; }).catch(function () {});
+  }
+  function forget(prefix) { Object.keys(MEM).forEach(function (k) { if (!prefix || k.indexOf(prefix + ':') === 0) delete MEM[k]; }); }
+  function reloadView() { if (Views[S.view] && S.view !== 'settings') Views[S.view]($('#view')); }
+  function convArgs() { var f = S.convFilter; return { q: f.q, category: f.category, from: f.from, to: f.to, limit: 150 }; }
 
   /* ---------- helpers ---------- */
   function $(s, r) { return (r || document).querySelector(s); }
@@ -3565,7 +3608,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     call('sync').then(function (r) {
       b.classList.remove('syncing'); b.disabled = false;
       toast(r.message || 'Sync finished', 5000);
-      return refreshState().then(function () { if (S.view !== 'settings') go(S.view, S.sub); });
+      forget(); refreshState(); reloadView();
     }).catch(function (e) { b.classList.remove('syncing'); b.disabled = false; renderSync(); fail(e); });
   }
 
@@ -3695,7 +3738,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       call('deleteConversation', { id: id }).then(function (r) {
         closeSheet(); toast('Deleted · ' + r.files + ' file' + (r.files === 1 ? '' : 's') + ' to the bin' + (r.todos ? ', ' + r.todos + ' to-do' + (r.todos === 1 ? '' : 's') + ' removed' : ''));
         delete S.open[id]; PAL.cache = null; PAL.convs = [];
-        refreshState().then(function () { go(S.view, S.sub, { force: true }); });
+        var gone = document.querySelector('[data-conv="' + cssEsc(id) + '"]'); if (gone) gone.remove();
+        forget(); refreshState(); reloadView();
       }).catch(function (e) { busy(b, false); fail(e); });
     });
   }
@@ -3707,7 +3751,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       var b = this; busy(b, true);
       call('deleteTodo', { key: key }).then(function () {
         closeSheet(); toast('To-do deleted'); PAL.cache = null;
-        refreshState().then(function () { if (S.view === 'todos') loadTodos(); else go(S.view, S.sub, { force: true }); });
+        var gone = document.querySelector('[data-tkey="' + cssEsc(key) + '"]'); if (gone) gone.remove();
+        forget('todos'); refreshState(); reloadView();
       }).catch(function (e) { busy(b, false); fail(e); });
     });
   }
@@ -3787,7 +3832,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     if (!PIN.status.enabled) return;
     call('pinLock').catch(function () {}).then(function () { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); });
   }
-  function pinStatus(st) { PIN.status = st || { enabled: false }; $('#lockbtn').hidden = !PIN.status.enabled; }
+  function pinStatus(st) { PIN.status = st || { enabled: false }; $('#lockbtn').hidden = !PIN.status.enabled; store('lifeos.pin', PIN.status.enabled ? '1' : '0'); }
   ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (ev) { window.addEventListener(ev, function () { PIN.last = Date.now(); }, { passive: true }); });
   function idleCheck() {
     if (PIN.status.enabled && PIN.token && $('#lock').hidden && Date.now() - PIN.last > (PIN.status.idleMinutes || 5) * 60000) {
@@ -3849,7 +3894,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   }
 
   Views.review = function (v) {
-    call('review').then(function (r) {
+    fresh('view', 'review', {}, function (r) {
       var html = head('Review', 'Each answer files every past and future conversation with that person, so this list gets shorter every day.');
       html += '<section class="card"><div class="card-h"><h2>New people</h2><span class="sub">' + r.people.length + ' to sort</span></div><div class="list">' +
         (r.people.length ? r.people.map(function (p) {
@@ -3869,7 +3914,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
             '<button class="btn danger" type="button" data-del-conv="' + esc(c.id) + '" data-title="' + esc(c.title) + '" data-todos="' + esc(c.todoCount || 0) + '" aria-label="Delete">' + ic('trash') + '</button></div></div></div><div></div></div>';
         }).join('') : '<div class="empty">' + ic('check') + 'Nothing waiting.</div>') + '</div></section>';
       v.innerHTML = page(html);
-    }).catch(function (e) { v.innerHTML = page(errorBox(e)); });
+    }, function (e) { v.innerHTML = page(errorBox(e)); });
   };
 
   Views.talks = function (v) {
@@ -3892,13 +3937,13 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     });
   };
   function loadConvs() {
-    var f = S.convFilter;
-    call('conversations', { q: f.q, category: f.category, from: f.from, to: f.to, limit: 150 }).then(function (r) {
+    fresh('convs', 'conversations', convArgs(), function (r) {
+      if (!$('#clist')) return;
       S.convRows = r.rows;
       $('#ctotal').textContent = r.total + ' conversation' + (r.total === 1 ? '' : 's');
       $('#clist').innerHTML = r.rows.length ? r.rows.map(function (c) { return convRow(c, true); }).join('') : '<div class="empty">' + ic('search') + 'No conversations match.</div>';
       var open = $('.item.open'); if (open && S.scrollToOpen) { open.scrollIntoView({ block: 'center' }); S.scrollToOpen = false; }
-    }).catch(function (e) { $('#clist').innerHTML = errorBox(e); });
+    }, function (e) { if ($('#clist')) $('#clist').innerHTML = errorBox(e); });
   }
 
   Views.todos = function (v) {
@@ -3914,7 +3959,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     loadTodos();
   };
   function loadTodos() {
-    call('todos', { status: S.todoFilter }).then(function (rows) {
+    fresh('todos', 'todos', { status: S.todoFilter }, function (rows) {
+      if (!$('#tlist')) return;
       var t = today();
       var groups = [['Overdue', function (x) { return x.status === 'open' && x.due && x.due < t; }], ['Today', function (x) { return x.status === 'open' && x.due === t; }],
         ['Upcoming', function (x) { return x.status === 'open' && x.due && x.due > t; }], ['No date', function (x) { return x.status === 'open' && !x.due; }], ['Done', function (x) { return x.status === 'done'; }]];
@@ -3922,11 +3968,11 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       groups.forEach(function (g) { var items = rows.filter(g[1]); if (items.length) html += '<div class="grp">' + g[0] + ' <span>' + items.length + '</span></div>' + items.map(todoRow).join(''); });
       $('#tlist').innerHTML = html ? '<div class="list">' + html + '</div>' : '<div class="empty">' + ic('check') + 'No to-dos here.</div>';
       if (S.flashTodo) { var el = $('[data-tkey="' + cssEsc(S.flashTodo) + '"]'); if (el) { el.scrollIntoView({ block: 'center' }); el.classList.add('flash'); } S.flashTodo = ''; }
-    }).catch(function (e) { $('#tlist').innerHTML = errorBox(e); });
+    }, function (e) { if ($('#tlist')) $('#tlist').innerHTML = errorBox(e); });
   }
 
   Views.people = function (v) {
-    call('people').then(function (rows) {
+    fresh('view', 'people', {}, function (rows) {
       v.innerHTML = page(head('People', 'Everyone Pocket has named. Their category decides where their conversations are filed.') +
         '<section class="card"><div class="card-b" style="padding-top:16px"><form id="addp" class="inline"><input type="text" id="pname" placeholder="Add a person, as Pocket names them" required>' +
         '<select id="pcat" class="w-auto" aria-label="Category"><option>Office</option><option>Personal</option></select><button class="btn primary" type="submit">Add</button></form></div></section>' +
@@ -3937,9 +3983,9 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         }).join('') : '<div class="empty">' + ic('people') + 'Nobody yet.</div>') + '</div></section>');
       $('#addp').addEventListener('submit', function (e) {
         e.preventDefault();
-        call('classifyPerson', { name: $('#pname').value.trim(), category: $('#pcat').value }).then(function () { toast('Added'); refreshState(); go('people'); }).catch(fail);
+        call('classifyPerson', { name: $('#pname').value.trim(), category: $('#pcat').value }).then(function () { toast('Added'); forget(); refreshState(); reloadView(); }).catch(fail);
       });
-    }).catch(function (e) { v.innerHTML = page(errorBox(e)); });
+    }, function (e) { v.innerHTML = page(errorBox(e)); });
   };
 
   Views.ask = function (v) {
@@ -4579,7 +4625,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       busy(file, true);
       call('classifyConversation', { id: id, category: c, addPeople: who ? who.value : '', rememberPeople: rem ? rem.checked : false }).then(function (r) {
         toast('Filed as ' + c + (r.alsoFiled ? ' · ' + r.alsoFiled + ' more filed' : ''));
-        return refreshState().then(function () { go(S.view, S.sub); });
+        var gone = file.closest('.item'); if (gone && S.view === 'review') gone.remove();
+        forget(); refreshState(); reloadView();
       }).catch(function (e2) { busy(file, false); fail(e2); });
       return;
     }
@@ -4589,7 +4636,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       call('classifyPerson', { key: person.getAttribute('data-person'), name: person.getAttribute('data-name'), category: person.getAttribute('data-cat') }).then(function (r) {
         toast(person.getAttribute('data-name') + ' → ' + person.getAttribute('data-cat') + (r.alsoFiled ? ' · ' + r.alsoFiled + ' filed' : ''));
         PAL.cache = null;
-        return refreshState().then(function () { go(S.view, S.sub); });
+        var gone2 = person.closest('.people-row'); if (gone2 && S.view === 'review') gone2.remove();
+        forget(); refreshState(); reloadView();
       }).catch(function (e2) { busy(person, false); fail(e2); });
       return;
     }
@@ -4599,8 +4647,9 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       todo.classList.toggle('done'); if (rowEl) rowEl.classList.toggle('done');
       call('completeTodo', { key: todo.getAttribute('data-todo'), reopen: reopen }).then(function (r) {
         toast(reopen ? 'Reopened' : 'Done' + (r.pocket === 'yes' ? ' · closed in Pocket too' : ''));
-        PAL.cache = null;
-        refreshState().then(function () { if (S.view === 'todos') loadTodos(); else go(S.view, S.sub); });
+        PAL.cache = null; forget('todos'); forget('conversations');
+        refreshState().then(function () { if (S.view === 'home') reloadView(); });
+        if (S.view === 'todos') loadTodos();
       }).catch(function (e2) { todo.classList.toggle('done'); if (rowEl) rowEl.classList.toggle('done'); fail(e2); });
       return;
     }
@@ -4803,14 +4852,24 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   var initial = (location.hash || '').replace('#', '').split('/');
   if (PAGES.some(function (p) { return p[0] === initial[0]; })) { S.view = initial[0]; S.sub = initial[1] || ''; }
   else if (initial[0] === 'playbook') S.view = 'docs';
-  function boot() {
-    return refreshState().then(function () { go(S.view, S.sub, { force: true }); maybeAskInstall(); });
+  function warm() {
+    prefetch('todos', { status: 'open' }); prefetch('conversations', convArgs()); prefetch('review', {}); prefetch('people', {});
   }
-  call('pinStatus').then(function (st) {
-    pinStatus(st);
-    if (st.enabled) { showLock(function () { boot().catch(function (e) { $('#view').innerHTML = page(errorBox(e)); }); }); return; }
-    return boot();
-  }).catch(function (e) {
+  function boot() {
+    return refreshState().then(function (st) {
+      pinStatus(st.pin);
+      go(S.view, S.sub, { force: true }); maybeAskInstall(); setTimeout(warm, 300);
+    });
+  }
+  function lockFirst() {
+    return call('pinStatus').then(function (st) {
+      pinStatus(st);
+      if (st.enabled) { showLock(function () { boot().catch(function (e) { $('#view').innerHTML = page(errorBox(e)); }); }); return; }
+      return boot();
+    });
+  }
+  // With no PIN, the first request already loads everything; with a PIN, ask for it first.
+  (store('lifeos.pin') === '1' ? lockFirst() : boot().catch(function (e) { if (/locked/i.test(e.message)) return lockFirst(); throw e; })).catch(function (e) {
     $('#view').innerHTML = page(errorBox(e) + (hasGAS ? '<div class="row-btns"><button class="btn" type="button" data-act="enter-demo">Explore with sample data</button></div>' : ''));
   });
 })();

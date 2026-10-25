@@ -182,7 +182,7 @@ const UrlFetchApp = {
   fetch(url, p) {
     p = p || {};
     const u = new URL(url);
-    if (u.host === 'www.googleapis.com' || u.host === 'sheets.googleapis.com') { const g = fakeGoogle(u, p); if (g) return g; throw new Error('fake Google: unhandled ' + (p.method || 'get') + ' ' + url); }
+    if (u.host === 'www.googleapis.com' || u.host === 'sheets.googleapis.com') { calls.google = (calls.google || 0) + 1; const g = fakeGoogle(u, p); if (g) return g; throw new Error('fake Google: unhandled ' + (p.method || 'get') + ' ' + url); }
     if (u.host === 'public.heypocketai.com' && u.pathname === '/mcp') {
       const b = JSON.parse(p.payload);
       if (b.method === 'initialize') return resp(200, { jsonrpc: '2.0', id: 1, result: {} }, { 'Mcp-Session-Id': 'sess1' });

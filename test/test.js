@@ -106,7 +106,6 @@ ok(r4s.created === 1, 'webhook-forced r4 processed');
 const dg = A.api('sendDigest');
 ok(dg.sent && /talks/.test(H.G.__mail.subject), 'digest mail: ' + H.G.__mail.subject);
 const fs = require('fs');
-if (process.env.UI_OUT) fs.writeFileSync(process.env.UI_OUT, A.UI_HTML_());
 console.log('\nALL PASSED');
 
 console.log('\n--- v2: Claude, inbox, phone ---');
@@ -464,3 +463,16 @@ ok(A.api('deleteTodo', { key: someTodo.key }).ok && !A.api('todos', { status: 'a
 A.api('sync');
 ok(!A.api('todos', { status: 'all' }).some(t => t.key === someTodo.key), 'a deleted to-do stays deleted after sync');
 console.log('\nALL V10 PASSED');
+
+console.log('\n--- v11: dashboard speed (Google API calls per tap) ---');
+A.api('sync');                       // a full open saves the folder and sheet layout
+let g0 = H.calls.google; A.api('state'); const stateCalls = H.calls.google - g0;
+g0 = H.calls.google; A.api('todos', { status: 'open' }); const todoCalls = H.calls.google - g0;
+g0 = H.calls.google; A.api('conversations', { limit: 20 }); const convCalls = H.calls.google - g0;
+ok(stateCalls <= 1 && todoCalls <= 1 && convCalls <= 1, 'one Google call per dashboard read: state ' + stateCalls + ', to-dos ' + todoCalls + ', conversations ' + convCalls);
+ok(A.api('state').pin && A.api('state').links.root, 'state carries the PIN status and the saved links');
+const savedRoot = JSON.parse(H.store.st_rootId);
+H.store.st_sheetTabs = JSON.stringify({ Conversations: 999 });   // stale layout, e.g. a tab deleted by hand
+ok(A.api('state').stats.conversations > 0, 'falls back to the full check when the saved layout is stale');
+ok(JSON.parse(H.store.st_sheetTabs).People !== undefined && JSON.parse(H.store.st_rootId) === savedRoot, 'layout re-saved after the full check');
+console.log('\nALL V11 PASSED');
