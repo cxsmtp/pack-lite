@@ -411,3 +411,26 @@ A.resetPin();
 ok(!A.api('pinStatus').enabled && A.api('state').cfg, 'resetPin from the editor removes it');
 ok(H.log.some(l => /Life OS PIN removed/.test(l)), 'reset logged');
 console.log('\nALL V8 PASSED');
+
+console.log('\n--- v9: Ideas category ---');
+const nowIso = new Date().toISOString();
+H.recordings.push(
+  { id: 'r_idea1', title: 'Shower thought', state: 'completed', duration: 120, recording_at: nowIso, created_at: nowIso, updated_at: nowIso, folder_id: null, tags: [{ id: 'ti', name: 'Ideas', color: 'x' }],
+    speakers: {}, transcript: { segments: [{ start: 0, end: 5, speaker: 'SPEAKER_00', text: 'A tiny app.' }] }, summarizations: { s: { processingStatus: 'completed', v2: { summary: { markdown: 'A tiny app idea.' } } } } },
+  { id: 'r_idea2', title: 'Walk notes', state: 'completed', duration: 180, recording_at: nowIso, created_at: nowIso, updated_at: nowIso, folder_id: null, tags: [],
+    speakers: {}, transcript: { segments: [{ start: 0, end: 5, speaker: 'SPEAKER_00', text: 'What if we built a prototype?' }] }, summarizations: { s: { processingStatus: 'completed', v2: { summary: { markdown: 'Brainstorm: what if a side project prototype for voice budgeting.' } } } } }
+);
+A.api('saveSettings', { cfg: { rules: 'office: standup, sprint\npersonal: mom, family\nideas: idea, brainstorm, what if, side project, prototype', lookbackDays: 30 } });
+A.api('sync');
+const ideas = A.api('conversations', { category: 'Ideas', limit: 50 }).rows;
+ok(ideas.some(r => r.title === 'Shower thought' && r.categorySource === 'tag'), 'Pocket tag "Ideas" files to Ideas: ' + JSON.stringify(ideas.map(r => [r.title, r.categorySource])));
+ok(ideas.some(r => r.title === 'Walk notes' && r.categorySource === 'keywords'), 'ideas keywords file to Ideas');
+ok(Object.values(H.items).some(i => i.kind === 'folder' && i.name === 'Ideas'), 'Ideas folder created in Drive');
+ok(A.api('state').stats.ideas >= 2, 'stats count Ideas');
+const anyConv = A.api('conversations', { q: 'Coffee with Sana', limit: 5 }).rows[0];
+A.api('classifyConversation', { id: anyConv.id, category: 'Ideas', rememberPeople: true });
+ok(A.api('conversations', { q: 'Coffee with Sana', limit: 5 }).rows[0].category === 'Ideas', 'conversation moved to Ideas by hand');
+ok(!A.api('people').some(p => p.category === 'Ideas'), 'people are never marked Ideas');
+threw = ''; try { A.api('classifyConversation', { id: anyConv.id, category: 'Shopping' }); } catch (e) { threw = e.message; }
+ok(/Bad category/.test(threw), 'unknown categories still refused');
+console.log('\nALL V9 PASSED');

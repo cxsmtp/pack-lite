@@ -42,7 +42,8 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 - **PIN lock (optional):** Settings → Security. Asked when you open Life OS and after the idle time you pick; the server refuses every action until it is entered. Five wrong tries lock it (5 min, then longer) and e-mail you. Forgot it? Run `resetPin` in the script editor.
 - **Themes:** Light, Dim, Dark or Auto, from the top bar or Settings → Appearance.
 - **Version:** shown next to the Life OS name at the top. Click it to open Settings → Updates.
-- **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Office or Personal, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
+- **Categories:** Office, Personal, Ideas (brainstorms and thinking aloud) and Unsorted. A Pocket tag named "Ideas", the `ideas:` keyword rule, a Pocket folder mapping or Claude can file a conversation under Ideas; each category gets its own Drive folder and notes template.
+- **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Filing, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
 
 ## On your phone
 
