@@ -234,7 +234,7 @@ console.log('\n--- v4: auto-update with integrity checks, token hardening ---');
 const src = fs.readFileSync(H.SCRIPT_PATH, 'utf8');
 const gh = H.gh;
 const SHA = (c) => c.repeat(40);
-gh.files[0].source = src.replace("const APP_VERSION = '1.0.0';", "const APP_VERSION = '0.9.0';");
+gh.files[0].source = src.replace("const APP_VERSION = '2.0.0';", "const APP_VERSION = '0.9.0';");
 gh.file = src;
 const chk = A.api('checkUpdate', {});
 ok(chk.latest === SHA('a') && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
@@ -253,7 +253,7 @@ ok(bk && Object.values(H.items).some(i => i.parent === bk.id && i.text && /0\.9\
 ok(A.api('checkUpdate', {}).upToDate, 'up to date after install');
 let threw = '';
 // tampered download: served file differs from the one release.json describes
-gh.head.sha = SHA('b'); gh.file = src.replace('1.0.0', '1.0.1'); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
+gh.head.sha = SHA('b'); gh.file = src.replace("'2.0.0'", "'2.0.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Integrity check failed/.test(threw) && gh.files[0].source === src, 'tampered code refused (SHA-256 mismatch)');
 delete gh.served;
@@ -273,13 +273,13 @@ ok(/truncated/.test(threw), 'truncated download refused');
 gh.head.sha = 'not-a-sha';
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Unexpected commit id/.test(threw), 'malformed commit id refused');
-gh.head.sha = SHA('c'); gh.file = src.replace('1.0.0', '1.0.1');
+gh.head.sha = SHA('c'); gh.file = src.replace("'2.0.0'", "'2.0.1'");
 ok(A.api('checkUpdate', { install: true }).applied, 'next verified update installs');
 // rollback
 const rb = A.api('rollback');
 ok(rb.applied && gh.files[0].source === src, 'rollback restores the previous code');
 // API switched off
-gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace('1.0.0', '1.0.2');
+gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.0.0'", "'2.0.2'");
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;
