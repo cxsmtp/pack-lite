@@ -92,6 +92,7 @@ const DEFAULT_CFG = {
   inboxAudio: 'pocket',        // audio with no transcript next to it: 'pocket' = send to Pocket, 'keep' = archive only
   preferredApp: 'claude',
   theme: 'auto',               // light | dim | dark | auto (the dashboard's look)
+  pinIdleMinutes: 5,           // with a PIN set: lock the dashboard after this many idle minutes
   autoUpdate: 'auto',          // auto | ask | off: install new code from GitHub main
   requireVerifiedCommits: true, // only install commits GitHub shows as signed and verified (PR merges on github.com are)      // claude | chatgpt | gemini | gemini-docs, for the no-API-key "Send to" buttons
 
@@ -293,7 +294,15 @@ function phoneAction_(cfg, action, p) {
 function api(action, args) {
   if (!isOwner_()) throw new Error('Not authorised');
   args = args || {};
+  const pinToken = args._pin;
+  delete args._pin;
+  if (PIN_OPEN_ACTIONS.indexOf(action) < 0 && !pinCheckSession_(pinToken)) throw new Error('LOCKED');
   const handlers = {
+    pinStatus: apiPinStatus_,
+    pinUnlock: apiPinUnlock_,
+    pinSet: apiPinSet_,
+    pinClear: apiPinClear_,
+    pinLock: function () { setState_('pinSessions', []); return { ok: true }; },
     state: apiState_,
     saveSettings: apiSaveSettings_,
     testConnection: apiTestConnection_,
@@ -326,6 +335,100 @@ function api(action, args) {
   };
   if (!handlers[action]) throw new Error('Unknown action ' + action);
   return JSON.parse(JSON.stringify(handlers[action](args)));  // strips Dates/undefined for the client
+}
+
+/* ──────────────────────────────── PIN lock ──────────────────────────────── */
+// Optional PIN for the dashboard. With one set, the server refuses every dashboard action until the PIN
+// is entered, and forgets the unlock after the chosen idle time. Phone shortcuts and webhooks keep using their token.
+const PIN_OPEN_ACTIONS = ['pinStatus', 'pinUnlock'];
+const PIN_ROUNDS = 2000;          // slows down guessing if the stored hash ever leaked
+const PIN_MAX_SESSIONS = 5;       // phone, laptop, a few browsers
+
+function pinEnabled_() { return !!props_().getProperty('pinHash'); }
+function pinHash_(pin, salt) {
+  let h = salt + ':' + pin;
+  for (let i = 0; i < PIN_ROUNDS; i++) h = sha256Hex_(salt + h);
+  return h;
+}
+function pinIdleMs_() { return Math.max(1, Number(getCfg_().pinIdleMinutes) || 5) * 60000; }
+function pinSessions_() { return getState_('pinSessions', []).filter(function (x) { return x.exp > Date.now(); }); }
+/** True when no PIN is set, or the token belongs to an unlocked session; each check keeps the session open. */
+function pinCheckSession_(token) {
+  if (!pinEnabled_()) return true;
+  if (typeof token !== 'string' || !/^[0-9a-f]{64}$/.test(token)) return false;
+  const h = sha256Hex_(token), list = pinSessions_();
+  const hit = list.filter(function (x) { return safeEqual_(x.h, h); })[0];
+  if (!hit) return false;
+  hit.exp = Date.now() + pinIdleMs_();
+  setState_('pinSessions', list);
+  return true;
+}
+function pinNewSession_() {
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  const list = pinSessions_().slice(-(PIN_MAX_SESSIONS - 1));
+  list.push({ h: sha256Hex_(token), exp: Date.now() + pinIdleMs_() });
+  setState_('pinSessions', list);
+  return token;
+}
+function apiPinStatus_() {
+  const lock = getState_('pinLock', { fails: 0, until: 0, strikes: 0 });
+  return { enabled: pinEnabled_(), length: Number(props_().getProperty('pinLength') || 0), idleMinutes: Math.round(pinIdleMs_() / 60000),
+    lockedForSec: Math.max(0, Math.ceil((lock.until - Date.now()) / 1000)) };
+}
+/** Checks a PIN. Five wrong tries lock it for 5 minutes, then 10, 20, up to an hour, and e-mail you. */
+function pinVerify_(pin) {
+  const lk = LockService.getUserLock();
+  if (!lk.tryLock(10000)) throw new Error('Busy, try again');
+  try {
+    const lock = getState_('pinLock', { fails: 0, until: 0, strikes: 0 });
+    const mins = function () { return Math.ceil((lock.until - Date.now()) / 60000); };
+    if (lock.until > Date.now()) throw new Error('Too many wrong PINs. Try again in ' + mins() + ' min.');
+    pin = String(pin == null ? '' : pin);
+    const ok = /^\d{4,8}$/.test(pin) && safeEqual_(pinHash_(pin, props_().getProperty('pinSalt') || ''), props_().getProperty('pinHash') || '');
+    if (!ok) {
+      lock.fails++;
+      if (lock.fails >= 5) {
+        lock.strikes++; lock.fails = 0;
+        lock.until = Date.now() + Math.min(60, 5 * Math.pow(2, lock.strikes - 1)) * 60000;
+        try {
+          MailApp.sendEmail({ to: Session.getEffectiveUser().getEmail(), name: APP_NAME, subject: '🔒 Life OS: wrong PIN entered 5 times',
+            body: 'A wrong Life OS PIN was entered 5 times in a row, so the dashboard is locked for ' + mins() + ' minutes.\n\nIf this was not you, someone is signed in to your Google account. Change your password and sign out other devices: https://myaccount.google.com/device-activity' });
+        } catch (e) { /* the lock still holds */ }
+      }
+      setState_('pinLock', lock);
+      throw new Error(lock.until > Date.now() ? 'Too many wrong PINs. Locked for ' + mins() + ' min.' : 'Wrong PIN');
+    }
+    setState_('pinLock', { fails: 0, until: 0, strikes: 0 });
+  } finally { lk.releaseLock(); }
+}
+function apiPinUnlock_(args) {
+  if (!pinEnabled_()) return { ok: true, token: '' };
+  pinVerify_(args.pin);
+  return { ok: true, token: pinNewSession_() };
+}
+function apiPinSet_(args) {
+  const pin = String(args.pin == null ? '' : args.pin);
+  if (!/^\d{4,8}$/.test(pin)) throw new Error('Use 4 to 8 digits');
+  if (pinEnabled_()) pinVerify_(args.current);
+  const salt = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  props_().setProperty('pinSalt', salt);
+  props_().setProperty('pinHash', pinHash_(pin, salt));
+  props_().setProperty('pinLength', String(pin.length));
+  setState_('pinSessions', []);
+  return { ok: true, token: pinNewSession_(), status: apiPinStatus_() };
+}
+function apiPinClear_(args) {
+  pinVerify_(args.current);
+  ['pinSalt', 'pinHash', 'pinLength'].forEach(function (k) { props_().deleteProperty(k); });
+  setState_('pinSessions', []);
+  return { ok: true, status: apiPinStatus_() };
+}
+/** Forgot your PIN? Run this from the script editor (only you can open it). Removes the PIN; set a new one in Settings → Security. */
+function resetPin() {
+  ['pinSalt', 'pinHash', 'pinLength'].forEach(function (k) { props_().deleteProperty(k); });
+  setState_('pinSessions', []);
+  setState_('pinLock', { fails: 0, until: 0, strikes: 0 });
+  Logger.log('Life OS PIN removed. Open the dashboard and set a new one in Settings → Security.');
 }
 
 /* ───────────────────────────── config & state ───────────────────────────── */
@@ -1658,7 +1761,7 @@ function apiState_() {
   const cfg = getCfg_();
   const key = getKey_();
   const out = {
-    app: { name: APP_NAME, version: APP_VERSION }, configured: !!key, demo: false,
+    app: { name: APP_NAME, version: APP_VERSION }, me: Session.getEffectiveUser().getEmail(), configured: !!key, demo: false,
     keyMasked: key ? key.slice(0, 8) + '…' + key.slice(-4) : '', cfg: cfg, account: getState_('account', null),
     lastSync: getState_('lastSync', null), backfillDone: getState_('backfillDone', false),
     health: { tasks: hasTasks_(), triggers: ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); }) },
@@ -1719,6 +1822,7 @@ function apiSaveSettings_(args) {
   if (args.clearGithubToken) props_().deleteProperty('githubToken');
   if (CLAUDE_MODELS.indexOf(next.aiModel) < 0) next.aiModel = DEFAULT_CFG.aiModel;
   next.theme = oneOf_(next.theme, ['light', 'dim', 'dark', 'auto'], 'auto');
+  next.pinIdleMinutes = [1, 5, 15, 30, 60].indexOf(Number(next.pinIdleMinutes)) >= 0 ? Number(next.pinIdleMinutes) : 5;
   ['aiMaxAgeDays', 'weeklyHour'].forEach(function (k) { next[k] = Number(next[k]); });
   if (next.backfillFrom !== cur.backfillFrom) setState_('backfillDone', false);
   saveCfg_(next);
@@ -2678,7 +2782,7 @@ function hash_(s) { return sha256Hex_(s).slice(0, 12); }
 
 /* Lets the Node test suite load this file as a module. Apps Script has no `module`, so this does nothing there. */
 if (typeof module === 'object' && module && module.exports) {
-  module.exports = { setup: setup, syncNow: syncNow, api: api, doPost: doPost, dailyDigest: dailyDigest, normalize_: normalize_, parseRpc_: parseRpc_, assertMediaUrl_: assertMediaUrl_, UI_HTML_: UI_HTML_ };
+  module.exports = { setup: setup, syncNow: syncNow, api: api, doPost: doPost, dailyDigest: dailyDigest, normalize_: normalize_, parseRpc_: parseRpc_, assertMediaUrl_: assertMediaUrl_, resetPin: resetPin, UI_HTML_: UI_HTML_ };
 }
 
 /* ─────────────────────────── dashboard (HTML) ─────────────────────────── */
@@ -3040,6 +3144,26 @@ pre.copy { margin: 0; padding: 14px; border-radius: 12px; background: var(--sunk
 .pal-f { display: flex; gap: 16px; padding: 10px 16px; border-top: 1px solid var(--line); color: var(--faint); font-size: .75rem; }
 mark { background: none; color: var(--accent); font-weight: 600; }
 
+/* PIN lock screen */
+.lock { position: fixed; inset: 0; z-index: 100; background: var(--bg); display: grid; place-items: center; padding: calc(24px + env(safe-area-inset-top, 0px)) 24px calc(24px + env(safe-area-inset-bottom, 0px)); animation: fade .2s ease-out; }
+.lock-in { width: min(320px, 100%); display: grid; justify-items: center; gap: 18px; text-align: center; }
+.lock .mark { width: 64px; height: 64px; border-radius: 18px; }
+.lock .mark i { width: 30px; height: 30px; border-width: 4px; }
+.lock .mark i::after { width: 8px; height: 8px; }
+.lock h2 { font-size: 1.2rem; }
+.lock p { color: var(--muted); font-size: .9rem; min-height: 1.4em; }
+.lock p.err { color: var(--danger); }
+.dots { display: flex; gap: 14px; height: 16px; }
+.dots i { width: 13px; height: 13px; border-radius: 50%; border: 1.5px solid var(--fg-2); transition: background-color .1s; }
+.dots i.on { background: var(--fg); border-color: var(--fg); }
+.dots.shake { animation: shake .4s; }
+@keyframes shake { 20%, 60% { transform: translateX(-9px); } 40%, 80% { transform: translateX(9px); } }
+.keys { display: grid; grid-template-columns: repeat(3, 76px); gap: 16px 22px; margin-top: 8px; }
+.keys button { width: 76px; height: 76px; border-radius: 50%; border: 0; background: var(--sunk); color: var(--fg); font-size: 1.7rem; font-weight: 400; display: grid; place-items: center; transition: background-color .1s, transform .08s; }
+.keys button:active { background: color-mix(in srgb, var(--fg) 18%, var(--sunk)); transform: scale(.95); }
+.keys button.txt { background: none; font-size: .95rem; font-weight: 500; color: var(--fg-2); }
+.keys button:disabled { opacity: .35; }
+.pinform { display: grid; gap: 10px; max-width: 320px; }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(24px + env(safe-area-inset-bottom, 0px)); z-index: 80; background: #1c1c1e; color: #fff; padding: 11px 18px; border-radius: 14px; box-shadow: var(--shadow-lg); font-size: .88rem; max-width: min(460px, calc(100vw - 32px)); text-align: center; animation: rise .2s ease-out; }
 .bnav { display: none; }
 
@@ -3104,6 +3228,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       <button class="ib only-phone" type="button" data-act="palette" aria-label="Search everything"><svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
       <button class="ib only-phone" type="button" data-view="review" aria-label="Review"><svg class="i" viewBox="0 0 24 24"><path d="M12 20.5s-7.5-4.6-9.3-9.2C1.5 8.1 3.6 4.5 7.1 4.5c2 0 3.6 1.1 4.9 2.8 1.3-1.7 2.9-2.8 4.9-2.8 3.5 0 5.6 3.6 4.4 6.8-1.8 4.6-9.3 9.2-9.3 9.2z"/></svg><span class="badge" id="mbadge" hidden></span></button>
       <button class="ib" type="button" id="syncbtn" aria-label="Sync now" title="Sync now"><svg class="i" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2"/><path d="M21 4v5h-5M3 20v-5h5"/></svg><span class="dot" id="sdot"></span></button>
+      <button class="ib only-desk" type="button" data-act="lock" id="lockbtn" aria-label="Lock now" title="Lock now" hidden><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="3"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></button>
       <button class="ib only-desk" type="button" data-act="theme" id="themebtn" aria-label="Change theme" title="Theme"></button>
       <button class="ib only-desk" type="button" data-act="fullscreen" id="fsbtn" aria-label="Full screen" title="Full screen" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
       <button class="ib only-desk" type="button" data-view="docs" aria-label="Docs" title="Docs"><svg class="i" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h9l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M14 3v5h5M8 13h8M8 17h5"/></svg></button>
@@ -3120,6 +3245,10 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   <div class="pal-f"><span><span class="kbd">↑</span> <span class="kbd">↓</span> move</span><span><span class="kbd">↵</span> open</span><span><span class="kbd">esc</span> close</span></div>
 </div></div>
 <div class="savebar" id="savebar" hidden><span>Unsaved changes</span><span class="row-btns"><button class="btn sm" type="button" data-act="discard">Discard</button><button class="btn sm primary" type="button" data-act="save">Save</button></span></div>
+<div class="lock" id="lock" hidden role="dialog" aria-modal="true" aria-label="Enter your PIN"><div class="lock-in">
+  <span class="mark" aria-hidden="true"><i></i></span><h2>Life OS is locked</h2><div class="dots" id="pindots"></div><p id="pinmsg">Enter your PIN</p>
+  <div class="keys" id="pinkeys"></div>
+</div></div>
 <div class="toast" id="toast" hidden></div>
 <input type="file" id="upfile" multiple accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.aac,.ogg,.opus,.flac,.webm,.srt,.vtt,.txt,.md" hidden>
 
@@ -3180,10 +3309,17 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   function pageName(id) { var p = PAGES.filter(function (x) { return x[0] === id; })[0]; return p ? p[1] : 'Home'; }
 
   /* ---------- backend bridge ---------- */
+  var PIN = { token: '', status: { enabled: false }, last: Date.now(), entry: '', after: null };
   function call(action, args) {
-    if (demo) return new Promise(function (res, rej) { setTimeout(function () { try { res(JSON.parse(JSON.stringify(Mock[action](args || {})))); } catch (e) { rej(e); } }, 160); });
-    return new Promise(function (res, rej) {
-      google.script.run.withSuccessHandler(res).withFailureHandler(function (e) { rej(e && e.message ? e : new Error(String(e))); }).api(action, args || {});
+    args = Object.assign({}, args || {});
+    if (PIN.token) args._pin = PIN.token;
+    var p = demo ? new Promise(function (res, rej) { setTimeout(function () { try { res(JSON.parse(JSON.stringify(Mock[action](args)))); } catch (e) { rej(e); } }, 160); })
+      : new Promise(function (res, rej) {
+        google.script.run.withSuccessHandler(res).withFailureHandler(function (e) { rej(e && e.message ? e : new Error(String(e))); }).api(action, args);
+      });
+    return p.catch(function (e) {
+      if (e && /LOCKED/.test(e.message)) { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); e = new Error('Locked. Enter your PIN.'); }
+      throw e;
     });
   }
 
@@ -3463,7 +3599,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       return '<button type="button" data-view="' + m[0] + '">' + ic(m[0]) + '<span>' + m[1] + '<small>' + m[2] + '</small></span></button>';
     }).join('') +
       '<button type="button" data-act="theme">' + ic(th[2]) + '<span>Theme: ' + th[1] + '<small>Light, Dim, Dark or Auto</small></span></button>' +
-      '<button type="button" data-act="install">' + ic('phone') + '<span>Add to Home Screen<small>Full screen, like an app</small></span></button></div>');
+      '<button type="button" data-act="install">' + ic('phone') + '<span>Add to Home Screen<small>Full screen, like an app</small></span></button>' +
+      (PIN.status.enabled ? '<button type="button" data-act="lock">' + ic('lock') + '<span>Lock now<small>Ask for the PIN again</small></span></button>' : '') + '</div>');
   }
   var INSTALL_KEY = 'lifeos.install';
   function isPhone() { return narrow() && ('ontouchstart' in window || navigator.maxTouchPoints > 0); }
@@ -3485,6 +3622,57 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     try { localStorage.getItem('x'); } catch (e) { return; }
     setTimeout(function () { if ($('#sheetbg').hidden && $('#palbg').hidden) openInstall(); }, 1400);
   }
+
+  /* ---------- PIN lock (the server refuses every action until it is entered) ---------- */
+  function showLock(after) {
+    if (after) PIN.after = after;
+    closeSheet(); closePalette();
+    PIN.entry = ''; paintDots();
+    $('#lock').hidden = false;
+    var secs = PIN.status && PIN.status.lockedForSec;
+    pinMsg(secs ? 'Too many tries. Try again in ' + Math.ceil(secs / 60) + ' min.' : 'Enter your PIN', !!secs);
+    $('#pinkeys').innerHTML = [1, 2, 3, 4, 5, 6, 7, 8, 9].map(function (n) { return '<button type="button" data-pin="' + n + '">' + n + '</button>'; }).join('') +
+      '<button type="button" class="txt" data-pin="ok" aria-label="Unlock">OK</button><button type="button" data-pin="0">0</button><button type="button" class="txt" data-pin="del" aria-label="Delete">⌫</button>';
+  }
+  function pinMsg(t, err) { var m = $('#pinmsg'); m.textContent = t; m.className = err ? 'err' : ''; }
+  function paintDots() {
+    var n = Math.max(PIN.status.length || 4, PIN.entry.length);
+    var html = ''; for (var i = 0; i < n; i++) html += '<i' + (i < PIN.entry.length ? ' class="on"' : '') + '></i>';
+    $('#pindots').innerHTML = html;
+  }
+  function pinKey(k) {
+    if (PIN.busy) return;
+    if (k === 'del') PIN.entry = PIN.entry.slice(0, -1);
+    else if (k === 'ok') { if (PIN.entry.length >= 4) pinTry(); return; }
+    else if (PIN.entry.length < 8) PIN.entry += k;
+    paintDots();
+    if (PIN.status.length && PIN.entry.length === PIN.status.length) pinTry();
+  }
+  function pinTry() {
+    PIN.busy = true; pinMsg('Checking…');
+    call('pinUnlock', { pin: PIN.entry }).then(function (r) {
+      PIN.busy = false; PIN.token = r.token; PIN.last = Date.now(); PIN.entry = '';
+      $('#lock').hidden = true;
+      var next = PIN.after; PIN.after = null; if (next) next();
+    }).catch(function (e) {
+      PIN.busy = false; PIN.entry = ''; paintDots();
+      var d = $('#pindots'); d.classList.remove('shake'); void d.offsetWidth; d.classList.add('shake');
+      pinMsg(e.message, true);
+    });
+  }
+  function lockNow() {
+    if (!PIN.status.enabled) return;
+    call('pinLock').catch(function () {}).then(function () { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); });
+  }
+  function pinStatus(st) { PIN.status = st || { enabled: false }; $('#lockbtn').hidden = !PIN.status.enabled; }
+  ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (ev) { window.addEventListener(ev, function () { PIN.last = Date.now(); }, { passive: true }); });
+  function idleCheck() {
+    if (PIN.status.enabled && PIN.token && $('#lock').hidden && Date.now() - PIN.last > (PIN.status.idleMinutes || 5) * 60000) {
+      PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); });
+    }
+  }
+  setInterval(idleCheck, 10000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) idleCheck(); });
 
   /* ---------- views ---------- */
   var Views = {};
@@ -3693,6 +3881,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     { id: 'filing', title: 'Office or Personal', sub: 'Rules for filing conversations', icon: 'split', color: '#ff9f0a' },
     { id: 'ai', title: 'AI and chat apps', sub: 'Claude, ChatGPT, Gemini, templates', icon: 'spark', color: '#bf5af2' },
     { id: 'uploads', title: 'Uploads and phone', sub: 'Upload audio, shortcuts, webhook', icon: 'upload', color: '#64d2ff' },
+    { id: 'security', title: 'Security', sub: 'PIN lock and who can open Life OS', icon: 'lock', color: '#30b0c7' },
     { id: 'appearance', title: 'Appearance', sub: 'Light, Dim, Dark, full screen', icon: 'palette', color: '#ff6482' },
     { id: 'updates', title: 'Updates', sub: 'Version and automatic updates', icon: 'update', color: '#5e5ce6' },
     { id: 'status', title: 'Status', sub: 'Health and recent activity', icon: 'pulse', color: '#8e8e93' }
@@ -3707,6 +3896,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     ['Preferred chat app', 'ai', 'preferredApp', 'claude chatgpt gemini send to'], ['Claude API key', 'ai', 'aikey', 'anthropic'], ['Claude model', 'ai', 'aiModel', 'opus sonnet haiku'], ['Weekly review', 'ai', 'weeklyReview', 'week'],
     ['Office template', 'ai', 'templateOffice', 'notes summary'], ['Personal template', 'ai', 'templatePersonal', 'notes summary'], ['Claude notes and promises', 'ai', 'aiNotes', 'commitments auto file'],
     ['Upload audio or transcripts', 'uploads', 'upbtn', 'inbox file voice memo zoom'], ['Audio with no transcript', 'uploads', 'inboxAudio', 'transcribe'], ['Phone and webhook URL', 'uploads', 'publicUrl', 'shortcut siri deployment'], ['Phone token', 'uploads', 'newtoken', 'webhook security'],
+    ['PIN lock', 'security', 'pinnew', 'passcode password lock code security'], ['Lock after idle', 'security', 'pinIdleMinutes', 'timeout auto lock'], ['Lock now', 'security', 'locknow', 'lock'],
     ['Theme', 'appearance', 'themes', 'dark light dim mode colour color'], ['Full screen', 'appearance', 'fsset', 'focus'], ['Add to Home Screen', 'appearance', 'installset', 'app install phone'],
     ['Install updates automatically', 'updates', 'autoUpdate', 'auto update version'], ['GitHub token', 'updates', 'ghtoken', 'rate limit 403'], ['Roll back', 'updates', 'updrollback', 'previous version'],
     ['Activity log', 'status', 'log', 'errors history'], ['Sample data', 'status', 'demo', 'demo try']
@@ -3782,6 +3972,19 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         fld('Audio with no transcript', sel('inboxAudio', c.inboxAudio, [['pocket', 'Send it to Pocket to transcribe'], ['keep', 'Just archive it']]), '', 'inboxAudio')) +
         card('Phone shortcuts and webhook', fld('Webhook URL', '<input type="text" id="publicUrl" value="' + esc(c.publicUrl) + '" placeholder="https://script.google.com/macros/s/…/exec">', 'Your second deployment (Who has access: Anyone). Steps in Docs → Phone and shortcuts.', 'publicUrl') +
         fld('Phone access', sw('phoneAsk', c.phoneAsk, 'Allow “Ask my memory” from shortcuts') + '<div class="inline"><span class="small muted mono">token …' + esc(String(c.webhookToken).slice(-6)) + '</span><button class="btn sm" type="button" id="newtoken">New token</button><button class="btn sm ghost" type="button" data-sub-go="docs/phone">Setup steps</button></div>', 'A new token stops old shortcuts and webhooks until you update them.', 'newtoken'));
+    },
+    security: function (st) {
+      var on = PIN.status.enabled;
+      return card('PIN lock', fld(on ? 'Change PIN' : 'Set a PIN', '<div class="pinform">' + (on ? '<input type="password" id="pincur" inputmode="numeric" autocomplete="off" placeholder="Current PIN" maxlength="8">' : '') +
+          '<input type="password" id="pinnew" inputmode="numeric" autocomplete="new-password" placeholder="New PIN, 4 to 8 digits" maxlength="8"><input type="password" id="pinnew2" inputmode="numeric" autocomplete="new-password" placeholder="New PIN again" maxlength="8">' +
+          '<div class="row-btns"><button class="btn primary" type="button" id="pinsave">' + (on ? 'Change PIN' : 'Turn on PIN') + '</button>' + (on ? '<button class="btn danger" type="button" id="pinoff">Remove PIN</button>' : '') + '</div><div id="pinres" class="res"></div></div>',
+          'Asked when you open Life OS and after you have been away. The server refuses every action until it is entered, so it can’t be skipped. Five wrong tries lock it and e-mail you. Forgot it? In the script editor, run <code>resetPin</code>.', 'pinnew') +
+        (on ? fld('Lock after', sel('pinIdleMinutes', st.cfg.pinIdleMinutes || 5, [[1, '1 minute idle'], [5, '5 minutes idle'], [15, '15 minutes idle'], [30, '30 minutes idle'], [60, '1 hour idle']], 'w-auto'), '', 'pinIdleMinutes') +
+          fld('Lock now', '<div class="row-btns"><button class="btn" type="button" id="locknow" data-act="lock">' + ic('lock') + 'Lock now</button></div>', '', 'locknow') : ''),
+        on ? '<span class="tag ok">On</span>' : '<span class="tag">Off</span>') +
+        card('Who can open Life OS', fld('Your Google account', '<div class="small">Only <b>' + esc(st.me || 'your Google account') + '</b>. Google checks your sign-in before the page loads, and Life OS checks again on every action.</div>') +
+          fld('Fingerprint on new devices', '<div class="row-btns"><a class="btn" href="https://myaccount.google.com/signinoptions/passkeys" target="_blank" rel="noopener">' + ic('open') + 'Set up Google passkeys</a><a class="btn ghost" href="https://myaccount.google.com/device-activity" target="_blank" rel="noopener">Your devices</a></div>',
+            'With a passkey, signing in to Google on any new device needs your fingerprint or face, and Google e-mails you about every new sign-in.'));
     },
     appearance: function () {
       return card('', fld('Theme', '<div class="themes" id="themes">' + THEMES.map(function (t) { return '<button type="button" class="theme th-' + t[0] + '" data-theme-pick="' + t[0] + '" aria-pressed="' + (S.theme === t[0]) + '"><i></i>' + t[1] + '</button>'; }).join('') + '</div>', 'Auto follows your phone or computer. Saved on this device and in your account.', 'themes') +
@@ -3872,6 +4075,25 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         call('newToken').then(function (st2) { S.state = st2; toast('New token made'); go('settings', 'uploads', { force: true }); }).catch(fail);
       });
     },
+    security: function () {
+      $('#pinsave').addEventListener('click', function () {
+        var a = $('#pinnew').value, b2 = $('#pinnew2').value, cur = $('#pincur') ? $('#pincur').value : undefined;
+        if (!/^\\d{4,8}$/.test(a)) { $('#pinres').innerHTML = '<span class="err-t">Use 4 to 8 digits.</span>'; return; }
+        if (a !== b2) { $('#pinres').innerHTML = '<span class="err-t">The two PINs don’t match.</span>'; return; }
+        var b = this; busy(b, true);
+        call('pinSet', { pin: a, current: cur }).then(function (r) {
+          busy(b, false); PIN.token = r.token; pinStatus(r.status); toast('PIN ' + (cur ? 'changed' : 'on')); go('settings', 'security', { force: true });
+        }).catch(function (e) { busy(b, false); $('#pinres').innerHTML = '<span class="err-t">' + esc(e.message) + '</span>'; });
+      });
+      var off = $('#pinoff');
+      if (off) off.addEventListener('click', function () {
+        var cur = $('#pincur').value;
+        if (!cur) { $('#pinres').innerHTML = '<span class="err-t">Enter your current PIN first.</span>'; $('#pincur').focus(); return; }
+        var b = this; busy(b, true);
+        call('pinClear', { current: cur }).then(function (r) { busy(b, false); PIN.token = ''; pinStatus(r.status); toast('PIN removed'); go('settings', 'security', { force: true }); })
+          .catch(function (e) { busy(b, false); $('#pinres').innerHTML = '<span class="err-t">' + esc(e.message) + '</span>'; });
+      });
+    },
     updates: function () {
       $('#updcheck').addEventListener('click', function () { runUpdate(this, false); });
       $('#updinstall').addEventListener('click', function () { runUpdate(this, true); });
@@ -3892,7 +4114,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       $('#updres').innerHTML = esc(r.applied ? r.message : r.blocked ? r.blocked : r.upToDate ? 'You are on the latest version.' : 'Latest on GitHub: ' + String(r.latest).slice(0, 7) + (r.message ? ' — ' + r.message : '') + (install ? '' : '. Press Install latest to update.'));
     }).catch(function (e) { busy(b, false); $('#updres').innerHTML = '<span class="err-t">' + esc(e.message) + '</span>'; });
   }
-  var CFG_TEXT = ['myNames', 'rootFolderName', 'timezone', 'backfillFrom', 'rules', 'templateOffice', 'templatePersonal', 'publicUrl', 'todoMaxAgeDays', 'aiMaxAgeDays',
+  var CFG_TEXT = ['pinIdleMinutes', 'myNames', 'rootFolderName', 'timezone', 'backfillFrom', 'rules', 'templateOffice', 'templatePersonal', 'publicUrl', 'todoMaxAgeDays', 'aiMaxAgeDays',
     'syncEveryMinutes', 'todosTo', 'defaultDueDays', 'digestHour', 'mixedRule', 'aiModel', 'weeklyDay', 'weeklyHour', 'preferredApp', 'inboxAudio', 'autoUpdate'];
   var CFG_BOOL = ['saveAudio', 'saveTranscript', 'pushCompletionToPocket', 'dailyDigest', 'aiNotes', 'aiCommitments', 'aiAutoFile', 'weeklyReview', 'inbox', 'phoneAsk', 'requireVerifiedCommits'];
   function saveSettings() {
@@ -4096,6 +4318,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       ['Full screen', fsOK ? 'Hide the browser around Life OS' : 'How to go full screen', 'full', '#8e8e93', toggleFull],
       ['Add to Home Screen', 'Open Life OS like an app', 'phone', '#ff375f', openInstall]
     ];
+    if (PIN.status.enabled) acts.unshift(['Lock now', 'Ask for the PIN again', 'lock', '#30b0c7', lockNow]);
     THEMES.forEach(function (t) { acts.push(['Theme: ' + t[1], t[0] === 'auto' ? 'Follow this device' : 'Switch to the ' + t[1].toLowerCase() + ' theme', t[2], '#ff6482', function () { setTheme(t[0]); }]); });
     acts.forEach(function (a) { list.push({ g: 'Actions', title: a[0], sub: a[1], icon: tile(a[2], a[3]), run: a[4], hay: a[0] + ' ' + a[1] }); });
     PAGES.forEach(function (p) { list.push({ g: 'Go to', title: p[1], sub: 'Page', icon: tile(p[0], '#636366'), run: function () { go(p[0]); }, hay: p[1] + ' page' }); });
@@ -4157,6 +4380,12 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     else if (e.key === 'Enter') { e.preventDefault(); palRun(PAL.sel); }
   });
   document.addEventListener('keydown', function (e) {
+    if (!$('#lock').hidden) {
+      if (/^[0-9]$/.test(e.key)) pinKey(e.key);
+      else if (e.key === 'Backspace') pinKey('del');
+      else if (e.key === 'Enter') pinKey('ok');
+      e.preventDefault(); return;
+    }
     var k = (e.key || '').toLowerCase();
     if ((e.metaKey || e.ctrlKey) && k === 'k') { e.preventDefault(); if ($('#palbg').hidden) openPalette(); else closePalette(); return; }
     if (k === 'escape') { if (!$('#palbg').hidden) closePalette(); else if (!$('#sheetbg').hidden) closeSheet(); return; }
@@ -4169,6 +4398,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     var t = e.target;
     if (t.id === 'sheetbg') { closeSheet(); return; }
     if (t.id === 'palbg') { closePalette(); return; }
+    var pk = t.closest('[data-pin]');
+    if (pk) { pinKey(pk.getAttribute('data-pin')); return; }
     var pi = t.closest('[data-pal]');
     if (pi) { palRun(Number(pi.getAttribute('data-pal'))); return; }
     var view = t.closest('[data-view]');
@@ -4201,13 +4432,14 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       else if (a === 'sheet-close') closeSheet();
       else if (a === 'theme') { var i = THEMES.map(function (x) { return x[0]; }).indexOf(S.theme); setTheme(THEMES[(i + 1) % THEMES.length][0]); if (!$('#sheetbg').hidden) openMore(); }
       else if (a === 'fullscreen') toggleFull();
+      else if (a === 'lock') lockNow();
       else if (a === 'install') openInstall();
       else if (a === 'install-done') { store(INSTALL_KEY, 'done'); closeSheet(); }
       else if (a === 'install-later') { store(INSTALL_KEY, String(Date.now())); closeSheet(); }
       else if (a === 'save') saveSettings();
       else if (a === 'discard') { setDirty(false); go(S.view, S.sub, { force: true }); }
-      else if (a === 'exit-demo') { demo = false; PAL.cache = null; refreshState().then(function () { go('home', '', { force: true }); }); }
-      else if (a === 'enter-demo') { demo = true; PAL.cache = null; refreshState().then(function () { go('home', '', { force: true }); }); }
+      else if (a === 'exit-demo') { demo = false; PAL.cache = null; PIN.token = ''; call('pinStatus').then(pinStatus).catch(function () {}); refreshState().then(function () { go('home', '', { force: true }); }); }
+      else if (a === 'enter-demo') { demo = true; PAL.cache = null; PIN.token = ''; pinStatus({ enabled: false }); refreshState().then(function () { go('home', '', { force: true }); }); }
       return;
     }
     var file = t.closest('[data-file]');
@@ -4262,9 +4494,9 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       call('classifyPerson', { key: t.getAttribute('data-pnote'), name: t.getAttribute('data-name'), category: s2 ? s2.value : t.getAttribute('data-cat'), notes: t.value }).then(function () { toast('Note saved'); PAL.cache = null; }).catch(fail);
       return;
     }
-    if (S.view === 'settings' && t.closest('#pane') && !t.closest('#prev')) setDirty(true);
+    if (S.view === 'settings' && t.closest('#pane') && !t.closest('#prev') && !t.closest('.pinform')) setDirty(true);
   });
-  document.addEventListener('input', function (e) { if (S.view === 'settings' && e.target.closest('#pane') && /input|textarea/i.test(e.target.tagName) && e.target.type !== 'file') setDirty(true); });
+  document.addEventListener('input', function (e) { if (S.view === 'settings' && e.target.closest('#pane') && /input|textarea/i.test(e.target.tagName) && e.target.type !== 'file' && !e.target.closest('.pinform')) setDirty(true); });
   window.addEventListener('hashchange', function () {
     var p = (location.hash || '').replace('#', '').split('/');
     if (p[0] && (p[0] !== S.view || (p[1] || '') !== S.sub) && PAGES.some(function (x) { return x[0] === p[0]; })) go(p[0], p[1] || '');
@@ -4335,8 +4567,9 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     });
     var cfg = { rootFolderName: 'Life OS — Conversations', timezone: 'Asia/Kolkata', myNames: 'Me', syncEveryMinutes: 15, saveAudio: true, saveTranscript: true, todosTo: 'tasks', defaultDueDays: 1, todoMaxAgeDays: 14,
       pushCompletionToPocket: true, dailyDigest: true, digestHour: 20, mixedRule: 'office', aiModel: 'claude-opus-5-5', aiNotes: true, aiCommitments: true, aiAutoFile: false, weeklyReview: true, weeklyDay: 'SUNDAY', weeklyHour: 18, aiMaxAgeDays: 30,
-      templateOffice: 'Decisions: what was decided and by whom\\nCommitments: who promised what to whom, with dates\\nRisks and open questions\\nNext steps', templatePersonal: 'Plans and dates\\nThings I promised\\nHealth, money and admin details worth keeping\\nFollow-ups', inbox: true, inboxAudio: 'pocket', preferredApp: 'claude', autoUpdate: 'auto', requireVerifiedCommits: true, publicUrl: '', phoneAsk: true, rules: 'office: standup, sprint, client, invoice, deadline, roadmap\\npersonal: mom, dad, family, gym, doctor, birthday', folderMap: {}, backfillFrom: '', webhookToken: 'sample-token-1234', claudeDone: false, theme: 'auto' };
+      templateOffice: 'Decisions: what was decided and by whom\\nCommitments: who promised what to whom, with dates\\nRisks and open questions\\nNext steps', templatePersonal: 'Plans and dates\\nThings I promised\\nHealth, money and admin details worth keeping\\nFollow-ups', inbox: true, inboxAudio: 'pocket', preferredApp: 'claude', autoUpdate: 'auto', requireVerifiedCommits: true, publicUrl: '', phoneAsk: true, rules: 'office: standup, sprint, client, invoice, deadline, roadmap\\npersonal: mom, dad, family, gym, doctor, birthday', folderMap: {}, backfillFrom: '', webhookToken: 'sample-token-1234', claudeDone: false, theme: 'auto', pinIdleMinutes: 5 };
     var ratings = { claude: { count: 2, sum: 6 }, chatgpt: { count: 2, sum: 4 } };
+    var pin = { code: '' };
     var lastSync = { ok: true, at: new Date(Date.now() - 6 * 60000).toISOString(), message: '2 new · 3 to-dos · 2 audio files' };
     function stats() {
       return { conversations: convs.length, hours: Math.round(convs.reduce(function (s, c) { return s + c.durationMin; }, 0) / 6) / 10,
@@ -4356,7 +4589,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     }
     return {
       state: function () {
-        return { app: { name: 'Pocket Life OS', version: '2.0.0' }, configured: true, demo: true, keyMasked: 'pk_user_…a1b2', cfg: cfg, account: { displayName: 'Alex Sample', plan: 'pro' }, lastSync: lastSync,
+        return { app: { name: 'Pocket Life OS', version: '2.0.0' }, me: 'you@gmail.com', configured: true, demo: true, keyMasked: 'pk_user_…a1b2', cfg: cfg, account: { displayName: 'Alex Sample', plan: 'pro' }, lastSync: lastSync,
           health: { tasks: true, triggers: ['scheduledSync', 'dailyDigest', 'autoUpdate'] }, links: { root: 'https://drive.google.com/', sheet: 'https://docs.google.com/spreadsheets/', memory: 'https://drive.google.com/' },
           update: { repo: 'cxsmtp/pack-lite', branch: 'main', installed: 'c7b3f11', check: { at: new Date().toISOString(), upToDate: true, latest: 'c7b3f11' }, last: null, hasToken: false },
           appRatings: ratings, ai: { configured: false, usage: { month: '2026-10', calls: 41, usd: 2.28 } }, uploads: [{ name: 'Zoom 2026-10-21 Northwind.m4a', status: 'sent, Pocket is transcribing' }],
@@ -4420,7 +4653,12 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       newToken: function () { cfg.webhookToken = 'sample-token-' + Math.floor(Math.random() * 9999); return this.state(); },
       sendDigest: function () { return { sent: true, message: 'Sample mode: no e-mail sent' }; },
       checkUpdate: function (a) { return { latest: 'c7b3f11', upToDate: true, applied: false, message: a.install ? 'Sample mode: nothing installed' : '', state: this.state() }; },
-      rollback: function () { return { applied: false, message: 'Sample mode: nothing rolled back' }; }
+      rollback: function () { return { applied: false, message: 'Sample mode: nothing rolled back' }; },
+      pinStatus: function () { return { enabled: !!pin.code, length: pin.code.length, idleMinutes: Number(cfg.pinIdleMinutes) || 5, lockedForSec: 0 }; },
+      pinUnlock: function (a) { if (!pin.code) return { ok: true, token: '' }; if (a.pin !== pin.code) throw new Error('Wrong PIN'); return { ok: true, token: 'a'.repeat(64) }; },
+      pinSet: function (a) { if (!/^\\d{4,8}$/.test(a.pin || '')) throw new Error('Use 4 to 8 digits'); if (pin.code && a.current !== pin.code) throw new Error('Wrong PIN'); pin.code = a.pin; return { ok: true, token: 'a'.repeat(64), status: this.pinStatus() }; },
+      pinClear: function (a) { if (a.current !== pin.code) throw new Error('Wrong PIN'); pin.code = ''; return { ok: true, status: this.pinStatus() }; },
+      pinLock: function () { return { ok: true }; }
     };
   })();
 
@@ -4428,9 +4666,13 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   var initial = (location.hash || '').replace('#', '').split('/');
   if (PAGES.some(function (p) { return p[0] === initial[0]; })) { S.view = initial[0]; S.sub = initial[1] || ''; }
   else if (initial[0] === 'playbook') S.view = 'docs';
-  refreshState().then(function () {
-    go(S.view, S.sub, { force: true });
-    maybeAskInstall();
+  function boot() {
+    return refreshState().then(function () { go(S.view, S.sub, { force: true }); maybeAskInstall(); });
+  }
+  call('pinStatus').then(function (st) {
+    pinStatus(st);
+    if (st.enabled) { showLock(function () { boot().catch(function (e) { $('#view').innerHTML = page(errorBox(e)); }); }); return; }
+    return boot();
   }).catch(function (e) {
     $('#view').innerHTML = page(errorBox(e) + (hasGAS ? '<div class="row-btns"><button class="btn" type="button" data-act="enter-demo">Explore with sample data</button></div>' : ''));
   });

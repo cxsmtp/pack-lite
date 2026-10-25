@@ -39,6 +39,7 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 ## Using it
 
 - **Search everything:** press `⌘K` (Mac) or `Ctrl K` (Windows), or `/`, or tap the magnifier on your phone. It finds conversations, to-dos, people, any setting and any docs page, and runs actions like Sync, Upload or switching theme.
+- **PIN lock (optional):** Settings → Security. Asked when you open Life OS and after the idle time you pick; the server refuses every action until it is entered. Five wrong tries lock it (5 min, then longer) and e-mail you. Forgot it? Run `resetPin` in the script editor.
 - **Themes:** Light, Dim, Dark or Auto, from the top bar or Settings → Appearance.
 - **Version:** shown next to the Life OS name at the top. Click it to open Settings → Updates.
 - **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Office or Personal, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
