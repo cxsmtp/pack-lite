@@ -11,7 +11,7 @@ function chain(target) {
 }
 // ---------- Properties ----------
 const store = {};
-const Props = { getProperty: k => (k in store ? store[k] : null), setProperty: (k, v) => { store[k] = String(v); }, deleteProperty: k => { delete store[k]; } };
+const Props = { getProperty: k => { calls.props++; return k in store ? store[k] : null; }, getProperties: () => { calls.props++; return Object.assign({}, store); }, setProperty: (k, v) => { store[k] = String(v); }, deleteProperty: k => { delete store[k]; } };
 // ---------- Google Drive + Sheets REST (the script may only use these: drive.file) ----------
 const FOLDER = 'application/vnd.google-apps.folder', GDOC = 'application/vnd.google-apps.document', GSHEET = 'application/vnd.google-apps.spreadsheet';
 const items = {};   // id -> record { id, kind, name, parent, mime, size, text, created, trashed, desc }
@@ -171,7 +171,7 @@ const gh = { head: { sha: 'a'.repeat(40), commit: { message: 'New feature\nbody'
     { deploymentId: 'PHONE', deploymentConfig: { versionNumber: 2, description: 'Phone' }, entryPoints: [{ entryPointType: 'WEB_APP', webApp: { entryPointConfig: { access: 'ANYONE_ANONYMOUS', executeAs: 'USER_DEPLOYING' } } }] }
   ] };
 const mcpCalls = []; const aiCalls = []; const uploads = []; const uploadReqs = [];
-let calls = { list: 0, detail: 0, audio: 0, s3: 0, upload: 0 };
+let calls = { list: 0, detail: 0, audio: 0, s3: 0, upload: 0, props: 0, google: 0 };
 function resp(code, body, headers) {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
   return { getResponseCode: () => code, getContentText: () => text, getAllHeaders: () => headers || {},

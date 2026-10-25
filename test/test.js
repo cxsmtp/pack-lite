@@ -233,7 +233,7 @@ console.log('\n--- v4: auto-update with integrity checks, token hardening ---');
 const src = fs.readFileSync(H.SCRIPT_PATH, 'utf8');
 const gh = H.gh;
 const SHA = (c) => c.repeat(40);
-gh.files[0].source = src.replace("const APP_VERSION = '2.0.0';", "const APP_VERSION = '0.9.0';");
+gh.files[0].source = src.replace("const APP_VERSION = '2.1.0';", "const APP_VERSION = '0.9.0';");
 gh.file = src;
 const chk = A.api('checkUpdate', {});
 ok(chk.latest === SHA('a') && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
@@ -252,7 +252,7 @@ ok(bk && Object.values(H.items).some(i => i.parent === bk.id && i.text && /0\.9\
 ok(A.api('checkUpdate', {}).upToDate, 'up to date after install');
 let threw = '';
 // tampered download: served file differs from the one release.json describes
-gh.head.sha = SHA('b'); gh.file = src.replace("'2.0.0'", "'2.0.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
+gh.head.sha = SHA('b'); gh.file = src.replace("'2.1.0'", "'2.1.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Integrity check failed/.test(threw) && gh.files[0].source === src, 'tampered code refused (SHA-256 mismatch)');
 delete gh.served;
@@ -272,13 +272,13 @@ ok(/truncated/.test(threw), 'truncated download refused');
 gh.head.sha = 'not-a-sha';
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Unexpected commit id/.test(threw), 'malformed commit id refused');
-gh.head.sha = SHA('c'); gh.file = src.replace("'2.0.0'", "'2.0.1'");
+gh.head.sha = SHA('c'); gh.file = src.replace("'2.1.0'", "'2.1.1'");
 ok(A.api('checkUpdate', { install: true }).applied, 'next verified update installs');
 // rollback
 const rb = A.api('rollback');
 ok(rb.applied && gh.files[0].source === src, 'rollback restores the previous code');
 // API switched off
-gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.0.0'", "'2.0.2'");
+gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.1.0'", "'2.1.2'");
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;
@@ -476,3 +476,49 @@ H.store.st_sheetTabs = JSON.stringify({ Conversations: 999 });   // stale layout
 ok(A.api('state').stats.conversations > 0, 'falls back to the full check when the saved layout is stale');
 ok(JSON.parse(H.store.st_sheetTabs).People !== undefined && JSON.parse(H.store.st_rootId) === savedRoot, 'layout re-saved after the full check');
 console.log('\nALL V11 PASSED');
+
+console.log('\n--- v12: one request per tap (bundle, settings read once) ---');
+let p0 = H.calls.props; g0 = H.calls.google;
+const bun = A.api('bundle');
+ok(H.calls.google - g0 <= 1, 'bundle reads the index sheet once (' + (H.calls.google - g0) + ' Google call)');
+ok(H.calls.props - p0 === 1, 'settings read once per request (' + (H.calls.props - p0) + ')');
+ok(bun.state.stats && Array.isArray(bun.todos) && bun.conversations.rows && bun.review.people && Array.isArray(bun.people), 'bundle carries state, to-dos, conversations, review and people');
+const openTodo = bun.todos[0];
+const done12 = A.api('completeTodo', { key: openTodo.key, _bundle: true });
+ok(done12.__result && done12.__bundle && !done12.__bundle.todos.some(function (t) { return t.key === openTodo.key; }), 'a change can return the refreshed pages in the same reply');
+ok(A.api('todos', { status: 'all' }).filter(function (t) { return t.key === openTodo.key; })[0].status === 'done', 'the change itself was saved');
+A.api('completeTodo', { key: openTodo.key, reopen: true });
+ok(!H.store.st_jobs || JSON.parse(H.store.st_jobs).names.indexOf('webhookSync') < 0, 'job list leaves out the one-off webhook job');
+const t12 = H.triggers.length; H.triggers.push('extraJob');
+ok(A.api('state').health.triggers.indexOf('extraJob') < 0, 'job list is reused for a few minutes');
+H.G.advance(11 * 60000);
+ok(A.api('state').health.triggers.indexOf('extraJob') >= 0, 'job list refreshed after 10 minutes');
+H.triggers.splice(t12, 1);
+const set12 = A.api('pinSet', { pin: '1357' });
+threw = ''; try { A.api('bundle'); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'bundle needs the PIN like every other page');
+ok(!A.api('pinStatus', { _bundle: true }).__bundle, 'locked actions never attach the pages');
+A.api('pinClear', { current: '1357', _pin: set12.token });
+ok(A.api('state').pin.enabled === false, 'PIN cleared again');
+console.log('\nALL V12 PASSED');
+
+console.log('\n--- v13: security fixes from review ---');
+const set13 = A.api('pinSet', { pin: '8642' });
+// Simulate a burst of guesses: this request's settings copy says "no wrong tries", storage says 4 already.
+H.store.st_pinLock = JSON.stringify({ fails: 4, until: 0, strikes: 0 });
+const realProps = PropertiesService.getUserProperties(), realGetAll = realProps.getProperties;
+realProps.getProperties = function () { const all = realGetAll(); all.st_pinLock = JSON.stringify({ fails: 0, until: 0, strikes: 0 }); return all; };
+threw = ''; try { A.api('pinUnlock', { pin: '0000' }); } catch (e) { threw = e.message; }
+realProps.getProperties = realGetAll;
+ok(/Too many wrong PINs/.test(threw), 'wrong-PIN counter is read under the lock, so parallel guesses still trip it: ' + threw);
+H.G.advance(6 * 60000);
+const un13 = A.api('pinUnlock', { pin: '8642' });
+A.api('pinClear', { current: '8642', _pin: un13.token });
+ok(!A.api('state').pin.enabled, 'right PIN still works after the lock expires');
+const rm = Object.keys(H.store).filter(k => /^st_removedConversations_\d+$/.test(k));
+ok(rm.length >= 1 && rm.every(k => H.store[k].length < 9000), 'delete list split into properties under the 9 KB limit');
+ok(!H.store.st_removedConversations && !rm.some(k => H.store[k].indexOf(mom.id) >= 0), 'deleted IDs are stored only as hashes');
+const before13 = A.api('conversations', { limit: 500 }).total;
+A.api('sync');
+ok(A.api('conversations', { limit: 500 }).total === before13 && !A.api('conversations', { limit: 500 }).rows.some(r => r.id === mom.id), 'deleted conversation still never comes back');
+console.log('\nALL V13 PASSED');

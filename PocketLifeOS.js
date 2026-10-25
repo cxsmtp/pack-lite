@@ -50,7 +50,7 @@
  */
 
 const APP_NAME = 'Pocket Life OS';
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
 const POCKET_API = 'https://public.heypocketai.com/api/v1';
 const POCKET_MCP_URL = 'https://public.heypocketai.com/mcp';
 const CATEGORIES = ['Office', 'Personal', 'Ideas', 'Unsorted'];
@@ -302,8 +302,17 @@ function api(action, args) {
   args = args || {};
   const pinToken = args._pin;
   delete args._pin;
-  if (PIN_OPEN_ACTIONS.indexOf(action) < 0 && !pinCheckSession_(pinToken)) throw new Error('LOCKED');
-  QUICK_OPEN_ = action !== 'sync';
+  const wantBundle = args._bundle === true;
+  delete args._bundle;
+  // One read of all settings per request, and one read of the index sheet however many handlers need it.
+  PROPS_MEMO_ = memoProps_(); WS_MEMO_ = null;
+  try {
+    if (PIN_OPEN_ACTIONS.indexOf(action) < 0 && !pinCheckSession_(pinToken)) throw new Error('LOCKED');
+    QUICK_OPEN_ = action !== 'sync';
+    return apiRun_(action, args, wantBundle && PIN_OPEN_ACTIONS.indexOf(action) < 0);
+  } finally { PROPS_MEMO_ = null; WS_MEMO_ = null; }
+}
+function apiRun_(action, args, wantBundle) {
   const handlers = {
     pinStatus: apiPinStatus_,
     pinUnlock: apiPinUnlock_,
@@ -313,6 +322,7 @@ function api(action, args) {
     deleteConversation: apiDeleteConversation_,
     deleteTodo: apiDeleteTodo_,
     state: apiState_,
+    bundle: apiBundle_,
     saveSettings: apiSaveSettings_,
     testConnection: apiTestConnection_,
     preview: apiPreview_,
@@ -343,7 +353,15 @@ function api(action, args) {
     sendDigest: function () { return sendDigest_(openWorkspace_(getCfg_()), true); }
   };
   if (!handlers[action]) throw new Error('Unknown action ' + action);
-  return JSON.parse(JSON.stringify(handlers[action](args)));  // strips Dates/undefined for the client
+  const result = handlers[action](args);
+  // Changes can ask for the refreshed pages in the same reply, which saves the dashboard a second round trip.
+  return JSON.parse(JSON.stringify(wantBundle ? { __result: result, __bundle: apiBundle_() } : result));  // strips Dates/undefined
+}
+/** Everything the dashboard's main pages show, from a single read of the index sheet. */
+const BUNDLE_CONV_ARGS_ = { q: '', category: 'All', from: '', to: '', limit: 150 };
+function apiBundle_() {
+  return { state: apiState_(), todos: apiTodos_({ status: 'open' }), conversations: apiConversations_(BUNDLE_CONV_ARGS_),
+    review: apiReview_(), people: apiPeople_() };
 }
 
 /* ──────────────────────────────── PIN lock ──────────────────────────────── */
@@ -389,7 +407,10 @@ function pinVerify_(pin) {
   const lk = LockService.getUserLock();
   if (!lk.tryLock(10000)) throw new Error('Busy, try again');
   try {
-    const lock = getState_('pinLock', { fails: 0, until: 0, strikes: 0 });
+    // Read the counter only now, under the lock, straight from storage: a copy taken when the request started
+    // would let many guesses sent at the same moment each see "no wrong tries yet".
+    const live = PropertiesService.getUserProperties().getProperty('st_pinLock');
+    const lock = live ? JSON.parse(live) : { fails: 0, until: 0, strikes: 0 };
     const mins = function () { return Math.ceil((lock.until - Date.now()) / 60000); };
     if (lock.until > Date.now()) throw new Error('Too many wrong PINs. Try again in ' + mins() + ' min.');
     pin = String(pin == null ? '' : pin);
@@ -442,7 +463,19 @@ function resetPin() {
 
 /* ───────────────────────────── config & state ───────────────────────────── */
 
-function props_() { return PropertiesService.getUserProperties(); }
+// Each PropertiesService read is a round trip inside Google, and one dashboard request used to make about twenty.
+// During a dashboard request every value is read once up front; writes still go straight through.
+let PROPS_MEMO_ = null;
+function props_() { return PROPS_MEMO_ || PropertiesService.getUserProperties(); }
+function memoProps_() {
+  const real = PropertiesService.getUserProperties();
+  const all = Object.assign({}, real.getProperties());
+  return {
+    getProperty: function (k) { return Object.prototype.hasOwnProperty.call(all, k) ? all[k] : null; },
+    setProperty: function (k, v) { real.setProperty(k, v); all[k] = String(v); return this; },
+    deleteProperty: function (k) { real.deleteProperty(k); delete all[k]; return this; }
+  };
+}
 
 function getCfg_() {
   const raw = props_().getProperty('cfg');
@@ -998,11 +1031,15 @@ const LOG_COLS = [['time', 'Time'], ['level', 'Level'], ['message', 'Message']];
 // Dashboard requests trust the folder and sheet IDs saved by the last sync instead of re-checking them,
 // which turns about five Google API calls per tap into one. Syncs, setup and triggers always check.
 let QUICK_OPEN_ = false;
+let WS_MEMO_ = null;   // the workspace already opened by this dashboard request
 function openWorkspace_(cfg) {
   if (QUICK_OPEN_) {
-    try { return openWorkspaceWith_(cfg, true); } catch (e) { /* something moved or was deleted: do the full check */ }
+    if (WS_MEMO_) return WS_MEMO_;
+    try { WS_MEMO_ = openWorkspaceWith_(cfg, true); return WS_MEMO_; } catch (e) { /* something moved or was deleted: do the full check */ }
   }
-  return openWorkspaceWith_(cfg, false);
+  const ctx = openWorkspaceWith_(cfg, false);
+  if (QUICK_OPEN_) WS_MEMO_ = ctx;
+  return ctx;
 }
 function openWorkspaceWith_(cfg, quick) {
   const ctx = { cfg: cfg, tz: cfg.timezone, folderCache: {}, dirtyMonths: {}, peopleDirty: false, quick: quick,
@@ -1156,7 +1193,7 @@ function buildQueue_(ctx) {
   const settleMs = cfg.settleMinutes * 60000;
   const removed = removedSet_('removedConversations');
   const queue = items.filter(function (it) {
-    if (!it || !it.id || removed[it.id]) return false;
+    if (!it || !it.id || removed.has(it.id)) return false;
     const row = ctx.conv.get(it.id);
     const created = Date.parse(it.created_at || it.createdAt || it.recording_at || '') || 0;
     if (!row) {
@@ -1183,7 +1220,7 @@ function processRecording_(ctx, item) {
 /** Files one normalised conversation (from Pocket, or imported locally via the inbox). */
 function processInfo_(ctx, info, opt) {
   const cfg = ctx.cfg;
-  if (removedSet_('removedConversations')[info.id]) return;   // you deleted it in Life OS
+  if (removedSet_('removedConversations').has(info.id)) return;   // you deleted it in Life OS
   const row = ctx.conv.get(info.id);
   let ai = null, aiStatus = (row && row.aiStatus) || '', aiTries = Number((row && row.aiTries) || 0);
   const aiFresh = row && row.aiStatus === 'done' && row.updatedAt === info.updatedAt;
@@ -1581,7 +1618,7 @@ function syncTodos_(ctx, info, cls, docUrl) {
   const removedTodos = removedSet_('removedTodos');
   info.actionItems.forEach(function (a, i) {
     const key = a.id ? info.id + ':' + a.id : info.id + ':' + hash_(a.title + i);
-    if (removedTodos[key]) return;
+    if (removedTodos.has(key)) return;
     const cur = ctx.todos.get(key);
     const due = a.due || (cfg.defaultDueDays > 0 ? shiftDate_(info.date, cfg.defaultDueDays) : '');
     const row = {
@@ -1608,7 +1645,7 @@ function syncTodos_(ctx, info, cls, docUrl) {
       const title = String(c.task || '').trim();
       if (!title) return;
       const key = info.id + ':c:' + hash_(title.toLowerCase());
-      if (removedTodos[key]) return;
+      if (removedTodos.has(key)) return;
       if (ctx.todos.get(key)) { ctx.todos.upsert({ key: key, category: cls.category, docUrl: docUrl }); return; }
       const due = /^\d{4}-\d{2}-\d{2}$/.test(c.due || '') ? c.due : (cfg.defaultDueDays > 0 ? shiftDate_(info.date, cfg.defaultDueDays) : '');
       const row = { key: key, title: title + (c.toWhom ? ' (promised to ' + c.toWhom + ')' : ''), due: due, status: 'open', category: cls.category,
@@ -1639,8 +1676,32 @@ function pushTodo_(ctx, row) {
 // its rows leave the index sheet, its to-dos leave Google Tasks, and the memory docs are rewritten without it.
 // Pocket's own copy stays in Pocket (its API has no delete for personal accounts), so the ID is remembered
 // and the next sync skips it.
-function removedSet_(name) { const o = {}; getState_(name, []).forEach(function (id) { o[id] = true; }); return o; }
-function rememberRemoved_(name, id) { const list = getState_(name, []); if (list.indexOf(id) < 0) list.push(id); setState_(name, list.slice(-5000)); }
+// What you deleted, so sync never brings it back. Kept as short one-way hashes (the IDs themselves aren't stored),
+// split over several properties because each one holds at most 9 KB.
+const REMOVED_MAX_ = 4000;     // 4000 × 16 hex chars ≈ 76 KB in all
+const REMOVED_SHARD_ = 400;    // ≈ 7.6 KB per property
+function removedKey_(id) { return sha256Hex_('removed:' + id).slice(0, 16); }
+function removedList_(name) {
+  let out = [];
+  for (let i = 0; ; i++) { const part = getState_(name + '_' + i, null); if (!part) break; out = out.concat(part); }
+  getState_(name, []).forEach(function (id) { out.push(removedKey_(id)); });   // older versions kept plain IDs
+  return out;
+}
+function removedSet_(name) {
+  const o = {};
+  removedList_(name).forEach(function (k) { o[k] = true; });
+  return { has: function (id) { return !!o[removedKey_(String(id))]; } };
+}
+function rememberRemoved_(name, id) {
+  let list = removedList_(name);
+  const k = removedKey_(String(id));
+  if (list.indexOf(k) < 0) list.push(k);
+  list = list.slice(-REMOVED_MAX_);
+  let i = 0;
+  for (; i * REMOVED_SHARD_ < list.length; i++) setState_(name + '_' + i, list.slice(i * REMOVED_SHARD_, (i + 1) * REMOVED_SHARD_));
+  for (; getState_(name + '_' + i, null); i++) props_().deleteProperty('st_' + name + '_' + i);
+  props_().deleteProperty('st_' + name);
+}
 function driveTrash_(id) {
   if (!id) return false;
   try { gapi_('patch', DRIVE_API + '/' + encodeURIComponent(id), { json: { trashed: true } }); return true; } catch (e) { return false; }   // already gone
@@ -1656,7 +1717,7 @@ function apiDeleteConversation_(args) {
   if (!r) throw new Error('Conversation not found');
   const out = { files: 0, todos: 0 };
   [r.docId, r.audioId].forEach(function (id) { if (driveTrash_(id)) out.files++; });
-  if (/^local-/.test(r.id)) {   // an upload: the transcript file you uploaded goes too
+  if (/^local-.{8,}/.test(r.id)) {   // an upload: the transcript file you uploaded goes too (never match on a blank ID)
     ctx.uploads.rows.filter(function (u) { return String(u.fileId).indexOf(r.id.slice(6)) === 0; }).forEach(function (u) { if (driveTrash_(u.fileId)) out.files++; });
   }
   ctx.todos.rows.filter(function (t) { return t.conversationId === r.id; }).forEach(function (t) { removeTodo_(ctx, t); out.todos++; });
@@ -1857,7 +1918,7 @@ function apiState_() {
     app: { name: APP_NAME, version: APP_VERSION }, me: Session.getEffectiveUser().getEmail(), configured: !!key, demo: false,
     keyMasked: key ? key.slice(0, 8) + '…' + key.slice(-4) : '', cfg: cfg, account: getState_('account', null),
     lastSync: getState_('lastSync', null), backfillDone: getState_('backfillDone', false),
-    health: { tasks: hasTasks_(), triggers: ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); }) },
+    health: { tasks: hasTasks_(), triggers: jobNames_() },
     links: { dashboard: ScriptApp.getService().getUrl() || '' }, claudeInstructions: CLAUDE_INSTRUCTIONS_(),
     ai: { configured: !!getAiKey_(), usage: getState_('aiUsage', null), models: CLAUDE_MODELS },
     appRatings: getState_('appRatings', {}),
@@ -2844,6 +2905,15 @@ function assertMediaUrl_(url) {
 
 /* ─────────────────────────────── triggers ───────────────────────────────── */
 
+/** Names of the scheduled jobs. Listing triggers is slow, so the answer is reused for 10 minutes. */
+function jobNames_(fresh) {
+  const saved = getState_('jobs', null);
+  if (!fresh && saved && Date.now() - saved.at < 600000) return saved.names;
+  const names = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); })
+    .filter(function (n) { return n !== 'webhookSync'; });
+  setState_('jobs', { names: names, at: Date.now() });
+  return names;
+}
 function installTriggers_(cfg) {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (['scheduledSync', 'dailyDigest', 'weeklyReview', 'autoUpdate'].indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
@@ -3423,35 +3493,48 @@ mark { background: none; color: var(--accent); font-weight: 600; }
 
   /* ---------- backend bridge ---------- */
   var PIN = { token: '', status: { enabled: false }, last: Date.now(), entry: '', after: null };
-  function call(action, args) {
+  // withPages: the reply also carries the refreshed main pages, so nothing has to be fetched again afterwards.
+  function call(action, args, withPages) {
     args = Object.assign({}, args || {});
     if (PIN.token) args._pin = PIN.token;
-    var p = demo ? new Promise(function (res, rej) { setTimeout(function () { try { res(JSON.parse(JSON.stringify(Mock[action](args)))); } catch (e) { rej(e); } }, 160); })
+    if (withPages) args._bundle = true;
+    var p = demo ? new Promise(function (res, rej) { setTimeout(function () { try { var r = Mock[action](args); if (withPages) r = { __result: r, __bundle: Mock.bundle() }; res(JSON.parse(JSON.stringify(r))); } catch (e) { rej(e); } }, 160); })
       : new Promise(function (res, rej) {
         google.script.run.withSuccessHandler(res).withFailureHandler(function (e) { rej(e && e.message ? e : new Error(String(e))); }).api(action, args);
       });
-    return p.catch(function (e) {
-      if (e && /LOCKED/.test(e.message) && S.state) { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); e = new Error('Locked. Enter your PIN.'); }
+    return p.then(function (r) {
+      if (r && r.__bundle) { forget(); seed(r.__bundle); return r.__result; }
+      return r;
+    }).catch(function (e) {
+      if (e && /LOCKED/.test(e.message) && S.state) { PIN.token = ''; showLock(afterUnlock); e = new Error('Locked. Enter your PIN.'); }
       throw e;
     });
   }
 
   /* ---------- instant pages: show the last answer straight away, then refresh it ---------- */
-  var MEM = {}, SLOT = {};
+  var MEM = {}, SLOT = {}, JUST_NOW = 20000;
+  var DEFAULT_CONV = { q: '', category: 'All', from: '', to: '', limit: 150 };   // same as the server's bundle
+  function memKey(action, args) { return action + ':' + JSON.stringify(args || {}); }
   function fresh(slot, action, args, render, onErr) {
-    var key = action + ':' + JSON.stringify(args || {});
+    var key = memKey(action, args);
     SLOT[slot] = key;
     var hit = MEM[key];
-    if (hit) render(hit, true);
+    if (hit) render(hit.v, true);
+    if (hit && Date.now() - hit.at < JUST_NOW) return Promise.resolve();   // fetched moments ago: no need to ask again
     return call(action, args).then(function (r) {
-      MEM[key] = r;
+      MEM[key] = { v: r, at: Date.now() };
       if (SLOT[slot] !== key) return;                    // you moved on to something else
-      if (!hit || JSON.stringify(hit) !== JSON.stringify(r)) render(r, false);
+      if (!hit || JSON.stringify(hit.v) !== JSON.stringify(r)) render(r, false);
     }).catch(function (e) { if (SLOT[slot] === key && !hit && onErr) onErr(e); });
   }
-  function prefetch(action, args) {
-    var key = action + ':' + JSON.stringify(args || {});
-    if (!MEM[key]) call(action, args).then(function (r) { if (!MEM[key]) MEM[key] = r; }).catch(function () {});
+  /** Stores the main pages that came back in one reply. */
+  function seed(b) {
+    var at = Date.now();
+    MEM[memKey('todos', { status: 'open' })] = { v: b.todos, at: at };
+    MEM[memKey('conversations', DEFAULT_CONV)] = { v: b.conversations, at: at };
+    MEM[memKey('review', {})] = { v: b.review, at: at };
+    MEM[memKey('people', {})] = { v: b.people, at: at };
+    applyState(b.state);
   }
   function forget(prefix) { Object.keys(MEM).forEach(function (k) { if (!prefix || k.indexOf(prefix + ':') === 0) delete MEM[k]; }); }
   function reloadView() { if (Views[S.view] && S.view !== 'settings') Views[S.view]($('#view')); }
@@ -3599,7 +3682,10 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   }
   function head(title, sub, actions) { return '<div class="ph"><div><h1>' + title + '</h1>' + (sub ? '<p>' + sub + '</p>' : '') + '</div>' + (actions ? '<div class="actions">' + actions + '</div>' : '') + '</div>'; }
   function errorBox(e) { return '<div class="card"><div class="empty">' + ic('x') + 'Couldn’t load: ' + esc(e && e.message ? e.message : e) + '</div></div>'; }
-  function refreshState() { return call('state').then(function (st) { S.state = st; if (st.cfg && st.cfg.theme && !store('lifeos.theme')) applyTheme(st.cfg.theme); renderShell(); return st; }); }
+  function applyState(st) { S.state = st; if (st.cfg && st.cfg.theme && !store('lifeos.theme')) applyTheme(st.cfg.theme); renderShell(); return st; }
+  function refreshState() { return call('state').then(applyState); }
+  /** Reloads everything in one request and redraws the page you're on. */
+  function refreshAll() { return call('bundle').then(function (b) { forget(); seed(b); reloadView(); return b.state; }); }
   function doSync() {
     if (!S.state || !S.state.configured) { toast('Add your Pocket API key first.'); go('settings', 'pocket'); return; }
     var b = $('#syncbtn');
@@ -3608,7 +3694,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     call('sync').then(function (r) {
       b.classList.remove('syncing'); b.disabled = false;
       toast(r.message || 'Sync finished', 5000);
-      forget(); refreshState(); reloadView();
+      refreshAll().catch(fail);
     }).catch(function (e) { b.classList.remove('syncing'); b.disabled = false; renderSync(); fail(e); });
   }
 
@@ -3735,11 +3821,11 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       '<div class="row-btns"><button class="btn solid-danger" type="button" id="delgo">' + ic('trash') + 'Delete everywhere</button><button class="btn" type="button" data-act="sheet-close">Cancel</button></div>');
     $('#delgo').addEventListener('click', function () {
       var b = this; busy(b, true, 'Deleting');
-      call('deleteConversation', { id: id }).then(function (r) {
+      call('deleteConversation', { id: id }, true).then(function (r) {
         closeSheet(); toast('Deleted · ' + r.files + ' file' + (r.files === 1 ? '' : 's') + ' to the bin' + (r.todos ? ', ' + r.todos + ' to-do' + (r.todos === 1 ? '' : 's') + ' removed' : ''));
         delete S.open[id]; PAL.cache = null; PAL.convs = [];
         var gone = document.querySelector('[data-conv="' + cssEsc(id) + '"]'); if (gone) gone.remove();
-        forget(); refreshState(); reloadView();
+        reloadView();
       }).catch(function (e) { busy(b, false); fail(e); });
     });
   }
@@ -3749,10 +3835,10 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       '<div class="row-btns"><button class="btn solid-danger" type="button" id="delgo">' + ic('trash') + 'Delete</button><button class="btn" type="button" data-act="sheet-close">Cancel</button></div>');
     $('#delgo').addEventListener('click', function () {
       var b = this; busy(b, true);
-      call('deleteTodo', { key: key }).then(function () {
+      call('deleteTodo', { key: key }, true).then(function () {
         closeSheet(); toast('To-do deleted'); PAL.cache = null;
         var gone = document.querySelector('[data-tkey="' + cssEsc(key) + '"]'); if (gone) gone.remove();
-        forget('todos'); refreshState(); reloadView();
+        reloadView();
       }).catch(function (e) { busy(b, false); fail(e); });
     });
   }
@@ -3792,9 +3878,13 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   }
 
   /* ---------- PIN lock (the server refuses every action until it is entered) ---------- */
+  // Once unlocked, everything is fetched again in one request.
+  function afterUnlock() { call('bundle').then(function (b) { seed(b); go(S.view, S.sub, { force: true }); }).catch(function (e) { $('#view').innerHTML = page(errorBox(e)); }); }
   function showLock(after) {
     if (after) PIN.after = after;
     closeSheet(); closePalette();
+    // Locked means nothing readable stays behind the keypad: drop the loaded pages and search results.
+    forget(); PAL.cache = null; PAL.convs = []; S.convRows = []; $('#view').innerHTML = '';
     PIN.entry = ''; paintDots();
     $('#lock').hidden = false;
     var secs = PIN.status && PIN.status.lockedForSec;
@@ -3830,13 +3920,13 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   }
   function lockNow() {
     if (!PIN.status.enabled) return;
-    call('pinLock').catch(function () {}).then(function () { PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); }); });
+    call('pinLock').catch(function () {}).then(function () { PIN.token = ''; showLock(afterUnlock); });
   }
   function pinStatus(st) { PIN.status = st || { enabled: false }; $('#lockbtn').hidden = !PIN.status.enabled; store('lifeos.pin', PIN.status.enabled ? '1' : '0'); }
   ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (ev) { window.addEventListener(ev, function () { PIN.last = Date.now(); }, { passive: true }); });
   function idleCheck() {
     if (PIN.status.enabled && PIN.token && $('#lock').hidden && Date.now() - PIN.last > (PIN.status.idleMinutes || 5) * 60000) {
-      PIN.token = ''; showLock(function () { go(S.view, S.sub, { force: true }); });
+      PIN.token = ''; showLock(afterUnlock);
     }
   }
   setInterval(idleCheck, 10000);
@@ -3983,7 +4073,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         }).join('') : '<div class="empty">' + ic('people') + 'Nobody yet.</div>') + '</div></section>');
       $('#addp').addEventListener('submit', function (e) {
         e.preventDefault();
-        call('classifyPerson', { name: $('#pname').value.trim(), category: $('#pcat').value }).then(function () { toast('Added'); forget(); refreshState(); reloadView(); }).catch(fail);
+        call('classifyPerson', { name: $('#pname').value.trim(), category: $('#pcat').value }, true).then(function () { toast('Added'); reloadView(); }).catch(fail);
       });
     }, function (e) { v.innerHTML = page(errorBox(e)); });
   };
@@ -4623,21 +4713,21 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       var id = file.getAttribute('data-file'), c = file.getAttribute('data-cat');
       var who = $('#who-' + cssEsc(id)), rem = $('#rem-' + cssEsc(id));
       busy(file, true);
-      call('classifyConversation', { id: id, category: c, addPeople: who ? who.value : '', rememberPeople: rem ? rem.checked : false }).then(function (r) {
+      call('classifyConversation', { id: id, category: c, addPeople: who ? who.value : '', rememberPeople: rem ? rem.checked : false }, true).then(function (r) {
         toast('Filed as ' + c + (r.alsoFiled ? ' · ' + r.alsoFiled + ' more filed' : ''));
         var gone = file.closest('.item'); if (gone && S.view === 'review') gone.remove();
-        forget(); refreshState(); reloadView();
+        reloadView();
       }).catch(function (e2) { busy(file, false); fail(e2); });
       return;
     }
     var person = t.closest('[data-person]');
     if (person) {
       busy(person, true);
-      call('classifyPerson', { key: person.getAttribute('data-person'), name: person.getAttribute('data-name'), category: person.getAttribute('data-cat') }).then(function (r) {
+      call('classifyPerson', { key: person.getAttribute('data-person'), name: person.getAttribute('data-name'), category: person.getAttribute('data-cat') }, true).then(function (r) {
         toast(person.getAttribute('data-name') + ' → ' + person.getAttribute('data-cat') + (r.alsoFiled ? ' · ' + r.alsoFiled + ' filed' : ''));
         PAL.cache = null;
         var gone2 = person.closest('.people-row'); if (gone2 && S.view === 'review') gone2.remove();
-        forget(); refreshState(); reloadView();
+        reloadView();
       }).catch(function (e2) { busy(person, false); fail(e2); });
       return;
     }
@@ -4645,11 +4735,10 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     if (todo) {
       var reopen = !!todo.getAttribute('data-done'), rowEl = todo.closest('.todo');
       todo.classList.toggle('done'); if (rowEl) rowEl.classList.toggle('done');
-      call('completeTodo', { key: todo.getAttribute('data-todo'), reopen: reopen }).then(function (r) {
+      call('completeTodo', { key: todo.getAttribute('data-todo'), reopen: reopen }, true).then(function (r) {
         toast(reopen ? 'Reopened' : 'Done' + (r.pocket === 'yes' ? ' · closed in Pocket too' : ''));
-        PAL.cache = null; forget('todos'); forget('conversations');
-        refreshState().then(function () { if (S.view === 'home') reloadView(); });
-        if (S.view === 'todos') loadTodos();
+        PAL.cache = null;
+        if (S.view === 'home' || S.view === 'todos') reloadView();
       }).catch(function (e2) { todo.classList.toggle('done'); if (rowEl) rowEl.classList.toggle('done'); fail(e2); });
       return;
     }
@@ -4664,7 +4753,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   document.addEventListener('change', function (e) {
     var t = e.target;
     if (t.matches('[data-pcat]')) {
-      call('classifyPerson', { key: t.getAttribute('data-pcat'), name: t.getAttribute('data-name'), category: t.value }).then(function (r) { toast('Saved' + (r.alsoFiled ? ' · ' + r.alsoFiled + ' filed' : '')); PAL.cache = null; refreshState(); }).catch(fail);
+      call('classifyPerson', { key: t.getAttribute('data-pcat'), name: t.getAttribute('data-name'), category: t.value }, true).then(function (r) { toast('Saved' + (r.alsoFiled ? ' · ' + r.alsoFiled + ' filed' : '')); PAL.cache = null; }).catch(fail);
       return;
     }
     if (t.matches('[data-pnote]')) {
@@ -4767,8 +4856,12 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       return n;
     }
     return {
+      bundle: function () {
+        var st = this.state(); st.pin = this.pinStatus();
+        return { state: st, todos: this.todos({ status: 'open' }), conversations: this.conversations(DEFAULT_CONV), review: this.review(), people: this.people() };
+      },
       state: function () {
-        return { app: { name: 'Pocket Life OS', version: '2.0.0' }, me: 'you@gmail.com', configured: true, demo: true, keyMasked: 'pk_user_…a1b2', cfg: cfg, account: { displayName: 'Alex Sample', plan: 'pro' }, lastSync: lastSync,
+        return { app: { name: 'Pocket Life OS', version: '2.1.0' }, me: 'you@gmail.com', configured: true, demo: true, keyMasked: 'pk_user_…a1b2', cfg: cfg, account: { displayName: 'Alex Sample', plan: 'pro' }, lastSync: lastSync,
           health: { tasks: true, triggers: ['scheduledSync', 'dailyDigest', 'autoUpdate'] }, links: { root: 'https://drive.google.com/', sheet: 'https://docs.google.com/spreadsheets/', memory: 'https://drive.google.com/' },
           update: { repo: 'cxsmtp/pack-lite', branch: 'main', installed: 'c7b3f11', check: { at: new Date().toISOString(), upToDate: true, latest: 'c7b3f11' }, last: null, hasToken: false },
           appRatings: ratings, ai: { configured: false, usage: { month: '2026-10', calls: 41, usd: 2.28 } }, uploads: [{ name: 'Zoom 2026-10-21 Northwind.m4a', status: 'sent, Pocket is transcribing' }],
@@ -4852,13 +4945,11 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   var initial = (location.hash || '').replace('#', '').split('/');
   if (PAGES.some(function (p) { return p[0] === initial[0]; })) { S.view = initial[0]; S.sub = initial[1] || ''; }
   else if (initial[0] === 'playbook') S.view = 'docs';
-  function warm() {
-    prefetch('todos', { status: 'open' }); prefetch('conversations', convArgs()); prefetch('review', {}); prefetch('people', {});
-  }
+  // One request fills every main page.
   function boot() {
-    return refreshState().then(function (st) {
-      pinStatus(st.pin);
-      go(S.view, S.sub, { force: true }); maybeAskInstall(); setTimeout(warm, 300);
+    return call('bundle').then(function (b) {
+      seed(b); pinStatus(b.state.pin);
+      go(S.view, S.sub, { force: true }); maybeAskInstall();
     });
   }
   function lockFirst() {
