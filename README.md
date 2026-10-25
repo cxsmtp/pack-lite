@@ -36,6 +36,14 @@ The dashboard's **Playbook** tab has a Pocket Pro comparison, the Claude Project
 5. **Deploy** → **New deployment** → **Web app**. Set Execute as: **Me** and Who has access: **Only myself**. Open the URL it gives you.
 6. In the dashboard, open **Settings**, paste your Pocket API key (Pocket app → Settings → Developer), then run **Test** → **Preview** → **Sync now**.
 
+## Using it
+
+- **Search everything:** press `⌘K` (Mac) or `Ctrl K` (Windows), or `/`, or tap the magnifier on your phone. It finds conversations, to-dos, people, any setting and any docs page, and runs actions like Sync, Upload or switching theme.
+- **PIN lock (optional):** Settings → Security. Asked when you open Life OS and after the idle time you pick; the server refuses every action until it is entered. Five wrong tries lock it (5 min, then longer) and e-mail you. Forgot it? Run `resetPin` in the script editor.
+- **Themes:** Light, Dim, Dark or Auto, from the top bar or Settings → Appearance.
+- **Version:** shown next to the Life OS name at the top. Click it to open Settings → Updates.
+- **Settings** are split into sections (Pocket, Archive and sync, To-dos and e-mail, Office or Personal, AI and chat apps, Uploads and phone, Appearance, Updates, Status). **Docs** holds the guides: how it works, connecting Claude, Pocket Pro, phone shortcuts, the API and privacy.
+
 ## On your phone
 
 Open the dashboard link on your phone. The first time, it shows how to add Life OS to your Home Screen (Safari: Share → Add to Home Screen; Chrome: ⋮ → Add to Home screen). From then on it opens full screen, with a bottom tab bar, a row of the people you talked with most recently, and one-tap upload. The icon comes from `icon.png` in this repo.

@@ -234,7 +234,7 @@ console.log('\n--- v4: auto-update with integrity checks, token hardening ---');
 const src = fs.readFileSync(H.SCRIPT_PATH, 'utf8');
 const gh = H.gh;
 const SHA = (c) => c.repeat(40);
-gh.files[0].source = src.replace("const APP_VERSION = '1.0.0';", "const APP_VERSION = '0.9.0';");
+gh.files[0].source = src.replace("const APP_VERSION = '2.0.0';", "const APP_VERSION = '0.9.0';");
 gh.file = src;
 const chk = A.api('checkUpdate', {});
 ok(chk.latest === SHA('a') && !chk.upToDate && !chk.applied, 'check only: update available, nothing installed');
@@ -253,7 +253,7 @@ ok(bk && Object.values(H.items).some(i => i.parent === bk.id && i.text && /0\.9\
 ok(A.api('checkUpdate', {}).upToDate, 'up to date after install');
 let threw = '';
 // tampered download: served file differs from the one release.json describes
-gh.head.sha = SHA('b'); gh.file = src.replace('1.0.0', '1.0.1'); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
+gh.head.sha = SHA('b'); gh.file = src.replace("'2.0.0'", "'2.0.1'"); gh.served = gh.file.replace('function setup()', 'function setup() { stealEverything(); ');
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Integrity check failed/.test(threw) && gh.files[0].source === src, 'tampered code refused (SHA-256 mismatch)');
 delete gh.served;
@@ -273,13 +273,13 @@ ok(/truncated/.test(threw), 'truncated download refused');
 gh.head.sha = 'not-a-sha';
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/Unexpected commit id/.test(threw), 'malformed commit id refused');
-gh.head.sha = SHA('c'); gh.file = src.replace('1.0.0', '1.0.1');
+gh.head.sha = SHA('c'); gh.file = src.replace("'2.0.0'", "'2.0.1'");
 ok(A.api('checkUpdate', { install: true }).applied, 'next verified update installs');
 // rollback
 const rb = A.api('rollback');
 ok(rb.applied && gh.files[0].source === src, 'rollback restores the previous code');
 // API switched off
-gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace('1.0.0', '1.0.2');
+gh.apiOff = true; gh.head.sha = SHA('d'); gh.file = src.replace("'2.0.0'", "'2.0.2'");
 threw = ''; try { A.api('checkUpdate', { install: true }); } catch (e) { threw = e.message; }
 ok(/script.google.com\/home\/usersettings/.test(threw), 'clear instructions when Apps Script API is off');
 gh.apiOff = false;
@@ -365,3 +365,49 @@ ok(foreign.parent === 'root' && !foreign.trashed && foreign.name === 'My private
 const convSheet = Object.values(H.sheets)[0].getSheetByName('Conversations').data;
 ok(convSheet.every(r => r.every(c => typeof c === 'string')), 'index sheet written RAW (strings only)');
 console.log('\nALL V7 PASSED');
+
+console.log('\n--- v8: optional PIN lock, enforced on the server ---');
+ok(A.api('pinStatus').enabled === false, 'no PIN by default');
+ok(A.api('state').configured !== undefined, 'dashboard works without a PIN');
+threw = ''; try { A.api('pinSet', { pin: '12a4' }); } catch (e) { threw = e.message; }
+ok(/4 to 8 digits/.test(threw), 'PIN must be 4-8 digits');
+const set8 = A.api('pinSet', { pin: '2468' });
+ok(set8.ok && /^[0-9a-f]{64}$/.test(set8.token) && set8.status.enabled && set8.status.length === 4, 'PIN set, session token issued');
+ok(!JSON.stringify(H.store).includes('"2468"') && !Object.values(H.store).includes('2468'), 'PIN itself never stored');
+threw = ''; try { A.api('state'); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'actions refused without a session');
+threw = ''; try { A.api('state', { _pin: 'f'.repeat(64) }); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'made-up token refused');
+ok(A.api('state', { _pin: set8.token }).cfg, 'valid session works');
+ok(A.api('pinStatus').enabled, 'status readable while locked');
+threw = ''; try { A.api('pinUnlock', { pin: '1111' }); } catch (e) { threw = e.message; }
+ok(threw === 'Wrong PIN', 'wrong PIN refused');
+const un8 = A.api('pinUnlock', { pin: '2468' });
+ok(/^[0-9a-f]{64}$/.test(un8.token) && A.api('todos', { status: 'open', _pin: un8.token }), 'right PIN unlocks');
+for (let i = 0; i < 5; i++) { try { A.api('pinUnlock', { pin: '0000' }); } catch (e) { threw = e.message; } }
+ok(/Locked for 5 min/.test(threw) && /wrong PIN/.test((H.G.__mail || {}).subject || ''), 'five wrong tries lock it and e-mail you: ' + threw);
+threw = ''; try { A.api('pinUnlock', { pin: '2468' }); } catch (e) { threw = e.message; }
+ok(/Try again in/.test(threw), 'even the right PIN waits out the lockout');
+ok(A.api('pinStatus').lockedForSec > 0, 'status shows the lockout');
+const lockState = JSON.parse(H.store.st_pinLock); lockState.until = 0; H.store.st_pinLock = JSON.stringify(lockState);
+const un9 = A.api('pinUnlock', { pin: '2468' });
+A.api('saveSettings', { cfg: { pinIdleMinutes: 15 }, _pin: un9.token });
+ok(A.api('pinStatus').idleMinutes === 15, 'idle time saved');
+A.api('saveSettings', { cfg: { pinIdleMinutes: 999 }, _pin: un9.token });
+ok(A.api('pinStatus').idleMinutes === 5, 'odd idle time falls back to 5');
+const sess = JSON.parse(H.store.st_pinSessions); sess.forEach(x => { x.exp = Date.now() - 1; }); H.store.st_pinSessions = JSON.stringify(sess);
+threw = ''; try { A.api('state', { _pin: un9.token }); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'idle session expires');
+const un10 = A.api('pinUnlock', { pin: '2468' });
+A.api('pinLock', { _pin: un10.token });
+threw = ''; try { A.api('state', { _pin: un10.token }); } catch (e) { threw = e.message; }
+ok(threw === 'LOCKED', 'Lock now ends every session');
+const un11 = A.api('pinUnlock', { pin: '2468' });
+threw = ''; try { A.api('pinSet', { pin: '13579', current: '9999', _pin: un11.token }); } catch (e) { threw = e.message; }
+ok(threw === 'Wrong PIN', 'changing the PIN needs the current one');
+const ch = A.api('pinSet', { pin: '13579', current: '2468', _pin: un11.token });
+ok(ch.status.length === 5, 'PIN changed');
+A.resetPin();
+ok(!A.api('pinStatus').enabled && A.api('state').cfg, 'resetPin from the editor removes it');
+ok(H.log.some(l => /Life OS PIN removed/.test(l)), 'reset logged');
+console.log('\nALL V8 PASSED');
