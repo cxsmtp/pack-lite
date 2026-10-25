@@ -277,7 +277,7 @@ const taskStore = { lists: [], tasks: {} };
 const Tasks = {
   Tasklists: { list: () => ({ items: taskStore.lists }), insert: (l) => { const x = { id: nid('tl'), title: l.title }; taskStore.lists.push(x); return x; }, get: (id) => { const x = taskStore.lists.find(l => l.id === id); if (!x) throw new Error('nf'); return x; } },
   Tasks: { insert: (t, l) => { const x = Object.assign({ id: nid('task'), status: 'needsAction', list: l }, t); taskStore.tasks[x.id] = x; return x; },
-    list: (l) => ({ items: Object.values(taskStore.tasks).filter(t => t.list === l) }), patch: (p, l, id) => Object.assign(taskStore.tasks[id], p) }
+    list: (l) => ({ items: Object.values(taskStore.tasks).filter(t => t.list === l) }), patch: (p, l, id) => Object.assign(taskStore.tasks[id], p), remove: (l, id) => { delete taskStore.tasks[id]; } }
 };
 // ---------- misc ----------
 const triggers = [];

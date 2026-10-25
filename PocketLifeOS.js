@@ -309,6 +309,8 @@ function api(action, args) {
     pinSet: apiPinSet_,
     pinClear: apiPinClear_,
     pinLock: function () { setState_('pinSessions', []); return { ok: true }; },
+    deleteConversation: apiDeleteConversation_,
+    deleteTodo: apiDeleteTodo_,
     state: apiState_,
     saveSettings: apiSaveSettings_,
     testConnection: apiTestConnection_,
@@ -937,6 +939,18 @@ Table_.prototype.append = function (row) {
     { json: { values: [row.map(safeCell_)] } });
   this.nextRow++;
 };
+/** Deletes one row from the sheet and from memory. */
+Table_.prototype.remove = function (key) {
+  const cur = this.index[String(key)];
+  if (!cur) return false;
+  gapi_('post', SHEETS_API + '/' + this.ss.id + ':batchUpdate', { json: { requests: [{ deleteDimension: {
+    range: { sheetId: this.ss.sheetIds[this.name], dimension: 'ROWS', startIndex: cur._row - 1, endIndex: cur._row } } }] } });
+  this.rows = this.rows.filter(function (r) { return r !== cur; });
+  this.rows.forEach(function (r) { if (r._row > cur._row) r._row--; });
+  delete this.index[String(key)];
+  this.nextRow--;
+  return true;
+};
 /** Keeps only the newest `keep` data rows. */
 Table_.prototype.trim = function (keep) {
   const extra = this.nextRow - 2 - keep;
@@ -1121,8 +1135,9 @@ function buildQueue_(ctx) {
   const forced = {};
   getState_('webhookQueue', []).forEach(function (id) { forced[id] = true; });
   const settleMs = cfg.settleMinutes * 60000;
+  const removed = removedSet_('removedConversations');
   const queue = items.filter(function (it) {
-    if (!it || !it.id) return false;
+    if (!it || !it.id || removed[it.id]) return false;
     const row = ctx.conv.get(it.id);
     const created = Date.parse(it.created_at || it.createdAt || it.recording_at || '') || 0;
     if (!row) {
@@ -1149,6 +1164,7 @@ function processRecording_(ctx, item) {
 /** Files one normalised conversation (from Pocket, or imported locally via the inbox). */
 function processInfo_(ctx, info, opt) {
   const cfg = ctx.cfg;
+  if (removedSet_('removedConversations')[info.id]) return;   // you deleted it in Life OS
   const row = ctx.conv.get(info.id);
   let ai = null, aiStatus = (row && row.aiStatus) || '', aiTries = Number((row && row.aiTries) || 0);
   const aiFresh = row && row.aiStatus === 'done' && row.updatedAt === info.updatedAt;
@@ -1543,8 +1559,10 @@ function renameKeepExt_(file, base) {
 function syncTodos_(ctx, info, cls, docUrl) {
   const cfg = ctx.cfg;
   const recent = Date.now() - info.start.getTime() < cfg.todoMaxAgeDays * 864e5;
+  const removedTodos = removedSet_('removedTodos');
   info.actionItems.forEach(function (a, i) {
     const key = a.id ? info.id + ':' + a.id : info.id + ':' + hash_(a.title + i);
+    if (removedTodos[key]) return;
     const cur = ctx.todos.get(key);
     const due = a.due || (cfg.defaultDueDays > 0 ? shiftDate_(info.date, cfg.defaultDueDays) : '');
     const row = {
@@ -1571,6 +1589,7 @@ function syncTodos_(ctx, info, cls, docUrl) {
       const title = String(c.task || '').trim();
       if (!title) return;
       const key = info.id + ':c:' + hash_(title.toLowerCase());
+      if (removedTodos[key]) return;
       if (ctx.todos.get(key)) { ctx.todos.upsert({ key: key, category: cls.category, docUrl: docUrl }); return; }
       const due = /^\d{4}-\d{2}-\d{2}$/.test(c.due || '') ? c.due : (cfg.defaultDueDays > 0 ? shiftDate_(info.date, cfg.defaultDueDays) : '');
       const row = { key: key, title: title + (c.toWhom ? ' (promised to ' + c.toWhom + ')' : ''), due: due, status: 'open', category: cls.category,
@@ -1594,6 +1613,54 @@ function pushTodo_(ctx, row) {
   if (row.due) t.due = row.due + 'T00:00:00.000Z';
   out.taskId = Tasks.Tasks.insert(t, taskListId_(ctx)).id;
   return out;
+}
+
+/* ───────────────────────────────── delete ───────────────────────────────── */
+// Deleting removes a conversation from everything Life OS keeps: its doc and audio go to the Drive bin,
+// its rows leave the index sheet, its to-dos leave Google Tasks, and the memory docs are rewritten without it.
+// Pocket's own copy stays in Pocket (its API has no delete for personal accounts), so the ID is remembered
+// and the next sync skips it.
+function removedSet_(name) { const o = {}; getState_(name, []).forEach(function (id) { o[id] = true; }); return o; }
+function rememberRemoved_(name, id) { const list = getState_(name, []); if (list.indexOf(id) < 0) list.push(id); setState_(name, list.slice(-5000)); }
+function driveTrash_(id) {
+  if (!id) return false;
+  try { gapi_('patch', DRIVE_API + '/' + encodeURIComponent(id), { json: { trashed: true } }); return true; } catch (e) { return false; }   // already gone
+}
+function removeTodo_(ctx, t) {
+  if (t.taskId && hasTasks_()) { try { Tasks.Tasks.remove(taskListId_(ctx), t.taskId); } catch (e) { /* already deleted in Tasks */ } }
+  ctx.todos.remove(t.key);
+  rememberRemoved_('removedTodos', t.key);
+}
+function apiDeleteConversation_(args) {
+  const ctx = openWorkspace_(getCfg_());
+  const r = ctx.conv.get(args.id);
+  if (!r) throw new Error('Conversation not found');
+  const out = { files: 0, todos: 0 };
+  [r.docId, r.audioId].forEach(function (id) { if (driveTrash_(id)) out.files++; });
+  if (/^local-/.test(r.id)) {   // an upload: the transcript file you uploaded goes too
+    ctx.uploads.rows.filter(function (u) { return String(u.fileId).indexOf(r.id.slice(6)) === 0; }).forEach(function (u) { if (driveTrash_(u.fileId)) out.files++; });
+  }
+  ctx.todos.rows.filter(function (t) { return t.conversationId === r.id; }).forEach(function (t) { removeTodo_(ctx, t); out.todos++; });
+  String(r.people || '').split(',').map(function (p) { return p.trim().toLowerCase(); }).filter(Boolean).forEach(function (k) {
+    const p = ctx.people.get(k);
+    if (p && Number(p.count) > 0) ctx.people.upsert({ key: p.key, count: Number(p.count) - 1 });
+  });
+  ctx.conv.remove(r.id);
+  rememberRemoved_('removedConversations', r.id);
+  markMemoryDirty_([String(r.date).slice(0, 7)]);
+  log_(ctx, 'info', 'Deleted a conversation from ' + r.date + ' (' + out.files + ' files, ' + out.todos + ' to-dos)');   // no title: it is meant to be gone
+  return { ok: true, files: out.files, todos: out.todos };
+}
+function apiDeleteTodo_(args) {
+  const ctx = openWorkspace_(getCfg_());
+  const t = ctx.todos.get(args.key);
+  if (!t) throw new Error('To-do not found');
+  removeTodo_(ctx, t);
+  if (t.conversationId && ctx.conv.get(t.conversationId)) {
+    const c = ctx.conv.get(t.conversationId);
+    ctx.conv.upsert({ id: c.id, todoCount: Math.max(0, Number(c.todoCount || 1) - 1) });
+  }
+  return { ok: true };
 }
 
 function completeExternal_(ctx, row) {
@@ -3104,6 +3171,14 @@ pre.copy { margin: 0; padding: 14px; border-radius: 12px; background: var(--sunk
 .todo .meta { margin-top: 4px; }
 .todo .meta a { color: var(--muted); }
 .due { font-size: .8rem; color: var(--muted); white-space: nowrap; padding-top: 2px; }
+.todo { grid-template-columns: 24px minmax(0, 1fr) auto 28px; }
+.tdel { width: 28px; height: 28px; margin-top: -3px; display: grid; place-items: center; border: 0; background: none; border-radius: 8px; color: var(--faint); opacity: .6; }
+.tdel:hover { opacity: 1; color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.tdel svg.i { width: 16px; height: 16px; }
+.btn.solid-danger { background: var(--danger); color: #fff; }
+.gone { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; font-size: .92rem; color: var(--fg-2); }
+.gone li { display: flex; gap: 10px; align-items: flex-start; }
+.gone li::before { content: '✓'; color: var(--danger); font-weight: 700; }
 .due.late { color: var(--danger); font-weight: 600; }
 .people-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 4px 14px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); }
 .list > .people-row:first-child { border-top: 0; }
@@ -3194,6 +3269,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   .item { padding: 14px 16px; gap: 2px 12px; }
   .item .aside { grid-column: 2 / -1; margin: 6px 0 0 -8px; }
   .todo, .people-row, .cap { padding-left: 16px; padding-right: 16px; }
+  .todo { grid-template-columns: 24px minmax(0, 1fr) auto 28px; gap: 2px 10px; }
   .people-row > .row-btns { grid-column: 2 / -1; }
   .people-row > .row-btns .btn { flex: 1; }
   .ver { font-size: .64rem; padding: 4px 6px; }
@@ -3313,7 +3389,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
     full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
     mail: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m4 7 8 6 8-6"/>',
     open: '<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>',
-    x: '<path d="M6 6l12 12M18 6 6 18"/>'
+    x: '<path d="M6 6l12 12M18 6 6 18"/>',
+    trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>'
   };
   function ic(name, cls) { return '<svg class="i' + (cls ? ' ' + cls : '') + '" viewBox="0 0 24 24" aria-hidden="true">' + (I[name] || '') + '</svg>'; }
   function tile(name, color) { return '<span class="tile" style="background:' + color + '">' + ic(name) + '</span>'; }
@@ -3510,7 +3587,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
         '<div class="row-btns"><button class="btn sm primary" type="button" data-send="' + esc(c.id) + '" data-title="' + esc(c.title) + '">' + ic('send') + 'Send to ' + esc(appLabel(prefApp())) + '</button>' + (c.hasExtNotes ? '<span class="tag info">has chat-app notes</span>' : '') + '</div>' +
         '<div class="row-btns"><span class="small muted">Move to</span>' + ['Office', 'Personal', 'Ideas', 'Unsorted'].filter(function (x) { return x !== c.category; }).map(function (x) {
           return '<button class="btn sm ' + x.toLowerCase() + '" type="button" data-file="' + esc(c.id) + '" data-cat="' + x + '">' + x + '</button>';
-        }).join('') + '</div></div>';
+        }).join('') + '<button class="btn sm danger" type="button" data-del-conv="' + esc(c.id) + '" data-title="' + esc(c.title) + '" data-todos="' + esc(c.todoCount || 0) + '" style="margin-left:auto">' + ic('trash') + 'Delete</button></div></div>';
     }
     return html + '</div>';
   }
@@ -3520,7 +3597,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       '<button class="check' + (t.status === 'done' ? ' done' : '') + '" type="button" aria-label="' + (t.status === 'done' ? 'Reopen' : 'Mark done') + '" data-todo="' + esc(t.key) + '" data-done="' + (t.status === 'done' ? '1' : '') + '"></button>' +
       '<div><div class="t">' + esc(t.title) + '</div><div class="meta">' + cat(t.category) + (t.docUrl ? '<a href="' + esc(t.docUrl) + '" target="_blank" rel="noopener">' + esc(t.conversation) + '</a>' : '<span>' + esc(t.conversation) + '</span>') +
       (t.source === 'Claude' ? '<span class="tag info">you promised</span>' : t.source === 'phone' ? '<span class="tag">from phone</span>' : '') + (t.priority ? '<span>' + esc(t.priority.toLowerCase()) + '</span>' : '') + '</div></div>' +
-      '<div class="due' + (late ? ' late' : '') + '" title="' + esc(t.due || '') + '">' + (t.due ? esc(nice(t.due)) : '') + '</div></div>';
+      '<div class="due' + (late ? ' late' : '') + '" title="' + esc(t.due || '') + '">' + (t.due ? esc(nice(t.due)) : '') + '</div>' +
+      '<button class="tdel" type="button" data-del-todo="' + esc(t.key) + '" data-title="' + esc(t.title) + '" aria-label="Delete this to-do" title="Delete">' + ic('trash') + '</button></div>';
   }
 
   /* ---------- send to a chat app (no API key) ---------- */
@@ -3603,6 +3681,35 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       }).catch(function (e2) { busy(b, false); fail(e2); });
     });
     paintApps();
+  }
+
+  /* ---------- delete ---------- */
+  function askDeleteConv(id, title, todos) {
+    openSheet('<div class="grab"></div><div class="sheet-h"><div><small>Delete everywhere</small><h2>' + esc(title) + '</h2></div><button class="ib" type="button" data-act="sheet-close" aria-label="Close">' + ic('x') + '</button></div>' +
+      '<ul class="gone"><li>Its Google Doc and audio go to your Drive bin</li><li>Its row leaves the index sheet</li>' + (Number(todos) ? '<li>Its ' + esc(todos) + ' to-do' + (Number(todos) === 1 ? '' : 's') + ' leave Life OS and Google Tasks</li>' : '') +
+      '<li>The Timeline and monthly memory docs are rewritten without it</li><li>Life OS never imports it again</li></ul>' +
+      '<p class="small muted">Pocket keeps its own copy until you delete it in the Pocket app. Google empties the Drive bin after 30 days, or empty it yourself to remove it for good straight away.</p>' +
+      '<div class="row-btns"><button class="btn solid-danger" type="button" id="delgo">' + ic('trash') + 'Delete everywhere</button><button class="btn" type="button" data-act="sheet-close">Cancel</button></div>');
+    $('#delgo').addEventListener('click', function () {
+      var b = this; busy(b, true, 'Deleting');
+      call('deleteConversation', { id: id }).then(function (r) {
+        closeSheet(); toast('Deleted · ' + r.files + ' file' + (r.files === 1 ? '' : 's') + ' to the bin' + (r.todos ? ', ' + r.todos + ' to-do' + (r.todos === 1 ? '' : 's') + ' removed' : ''));
+        delete S.open[id]; PAL.cache = null; PAL.convs = [];
+        refreshState().then(function () { go(S.view, S.sub, { force: true }); });
+      }).catch(function (e) { busy(b, false); fail(e); });
+    });
+  }
+  function askDeleteTodo(key, title) {
+    openSheet('<div class="grab"></div><div class="sheet-h"><div><small>Delete to-do</small><h2>' + esc(title) + '</h2></div><button class="ib" type="button" data-act="sheet-close" aria-label="Close">' + ic('x') + '</button></div>' +
+      '<p class="small muted">Removes it from Life OS and Google Tasks, and it won’t come back on the next sync. The conversation it came from stays.</p>' +
+      '<div class="row-btns"><button class="btn solid-danger" type="button" id="delgo">' + ic('trash') + 'Delete</button><button class="btn" type="button" data-act="sheet-close">Cancel</button></div>');
+    $('#delgo').addEventListener('click', function () {
+      var b = this; busy(b, true);
+      call('deleteTodo', { key: key }).then(function () {
+        closeSheet(); toast('To-do deleted'); PAL.cache = null;
+        refreshState().then(function () { if (S.view === 'todos') loadTodos(); else go(S.view, S.sub, { force: true }); });
+      }).catch(function (e) { busy(b, false); fail(e); });
+    });
   }
 
   /* ---------- sheets ---------- */
@@ -3758,7 +3865,8 @@ mark { background: none; color: var(--accent); font-weight: 600; }
             '<div class="fields" style="gap:10px;margin-top:12px"><input type="text" id="who-' + esc(c.id) + '" placeholder="Who was it with? (optional)">' +
             '<label class="switch small"><span>Remember these people</span><input type="checkbox" id="rem-' + esc(c.id) + '" checked></label>' +
             '<div class="row-btns"><button class="btn office' + (c.aiCategory === 'Office' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Office" style="flex:1">Office</button><button class="btn personal' + (c.aiCategory === 'Personal' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Personal" style="flex:1">Personal</button><button class="btn ideas' + (c.aiCategory === 'Ideas' ? ' pick' : '') + '" type="button" data-file="' + esc(c.id) + '" data-cat="Ideas" style="flex:1">Ideas</button>' +
-            (c.docUrl ? '<a class="btn" href="' + esc(c.docUrl) + '" target="_blank" rel="noopener" aria-label="Open the doc">' + ic('doc') + '</a>' : '') + '</div></div></div><div></div></div>';
+            (c.docUrl ? '<a class="btn" href="' + esc(c.docUrl) + '" target="_blank" rel="noopener" aria-label="Open the doc">' + ic('doc') + '</a>' : '') +
+            '<button class="btn danger" type="button" data-del-conv="' + esc(c.id) + '" data-title="' + esc(c.title) + '" data-todos="' + esc(c.todoCount || 0) + '" aria-label="Delete">' + ic('trash') + '</button></div></div></div><div></div></div>';
         }).join('') : '<div class="empty">' + ic('check') + 'Nothing waiting.</div>') + '</div></section>';
       v.innerHTML = page(html);
     }).catch(function (e) { v.innerHTML = page(errorBox(e)); });
@@ -4437,6 +4545,10 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       openSend({ id: cid2, title: snd.getAttribute('data-title'), gap: !!gapText(row2), kind: snd.getAttribute('data-kind') || 'notes' });
       return;
     }
+    var dc = t.closest('[data-del-conv]');
+    if (dc) { e.stopPropagation(); askDeleteConv(dc.getAttribute('data-del-conv'), dc.getAttribute('data-title'), dc.getAttribute('data-todos')); return; }
+    var dt = t.closest('[data-del-todo]');
+    if (dt) { askDeleteTodo(dt.getAttribute('data-del-todo'), dt.getAttribute('data-title')); return; }
     var cp = t.closest('[data-copy]');
     if (cp) { copyText(cp.getAttribute('data-copy'), cp); return; }
     var act = t.closest('[data-act]');
@@ -4676,7 +4788,14 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       pinUnlock: function (a) { if (!pin.code) return { ok: true, token: '' }; if (a.pin !== pin.code) throw new Error('Wrong PIN'); return { ok: true, token: 'a'.repeat(64) }; },
       pinSet: function (a) { if (!/^\\d{4,8}$/.test(a.pin || '')) throw new Error('Use 4 to 8 digits'); if (pin.code && a.current !== pin.code) throw new Error('Wrong PIN'); pin.code = a.pin; return { ok: true, token: 'a'.repeat(64), status: this.pinStatus() }; },
       pinClear: function (a) { if (a.current !== pin.code) throw new Error('Wrong PIN'); pin.code = ''; return { ok: true, status: this.pinStatus() }; },
-      pinLock: function () { return { ok: true }; }
+      pinLock: function () { return { ok: true }; },
+      deleteConversation: function (a) {
+        var c = convs.filter(function (x) { return x.id === a.id; })[0]; if (!c) throw new Error('Conversation not found');
+        var n = todos.filter(function (t) { return t.conversation === c.title; }).length;
+        convs = convs.filter(function (x) { return x !== c; }); todos = todos.filter(function (t) { return t.conversation !== c.title; });
+        return { ok: true, files: 2, todos: n };
+      },
+      deleteTodo: function (a) { todos = todos.filter(function (t) { return t.key !== a.key; }); return { ok: true }; }
     };
   })();
 

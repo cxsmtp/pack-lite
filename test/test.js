@@ -434,3 +434,33 @@ ok(!A.api('people').some(p => p.category === 'Ideas'), 'people are never marked 
 threw = ''; try { A.api('classifyConversation', { id: anyConv.id, category: 'Shopping' }); } catch (e) { threw = e.message; }
 ok(/Bad category/.test(threw), 'unknown categories still refused');
 console.log('\nALL V9 PASSED');
+
+console.log('\n--- v10: delete a conversation or a to-do everywhere ---');
+const mom = A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows[0];
+const momRow = Object.values(H.sheets)[0].getSheetByName('Conversations').data.find(r => r[0] === mom.id);
+const momTodos = A.api('todos', { status: 'all' }).filter(t => t.conversation === mom.title);
+const taskIds = Object.values(H.taskStore.tasks).filter(t => /Book train tickets/.test(t.title)).map(t => t.id);
+ok(mom && momRow && momTodos.length && taskIds.length, 'test conversation has a doc, sheet row, to-dos and a Google Task');
+const docItem = Object.values(H.items).find(i => i.kind === 'file' && /Call with Mom/.test(i.name) && !i.trashed && i.mime === H.GDOC);
+const del = A.api('deleteConversation', { id: mom.id });
+ok(del.ok && del.todos === momTodos.length, 'delete reports what it removed: ' + JSON.stringify(del));
+ok(docItem && docItem.trashed, 'conversation doc moved to the Drive bin');
+ok(!A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows.length, 'gone from the dashboard');
+ok(!Object.values(H.sheets)[0].getSheetByName('Conversations').data.some(r => r && r[0] === mom.id), 'row removed from the index sheet');
+ok(!A.api('todos', { status: 'all' }).some(t => t.conversation === mom.title), 'its to-dos removed');
+ok(taskIds.every(id => !H.taskStore.tasks[id]), 'its Google Tasks removed');
+ok(!JSON.stringify(H.store.st_memoryDirty || '').includes('false') || JSON.parse(H.store.st_memoryDirty).months.length >= 1, 'memory docs marked for rewrite');
+const convSheetData = Object.values(H.sheets)[0].getSheetByName('Conversations').data;
+const nextConv = A.api('conversations', { limit: 50 }).rows[0];
+A.api('classifyConversation', { id: nextConv.id, category: 'Personal' });
+const after = Object.values(H.sheets)[0].getSheetByName('Conversations').data.find(r => r && r[0] === nextConv.id);
+ok(after && after[7] === 'Personal', 'rows below the deleted one still update the right sheet row');
+A.api('sync');
+ok(!A.api('conversations', { q: 'Call with Mom', limit: 5 }).rows.length, 'the next sync does not bring it back from Pocket');
+threw = ''; try { A.api('deleteConversation', { id: mom.id }); } catch (e) { threw = e.message; }
+ok(/not found/.test(threw), 'deleting twice is refused cleanly');
+const someTodo = A.api('todos', { status: 'all' })[0];
+ok(A.api('deleteTodo', { key: someTodo.key }).ok && !A.api('todos', { status: 'all' }).some(t => t.key === someTodo.key), 'a single to-do can be deleted');
+A.api('sync');
+ok(!A.api('todos', { status: 'all' }).some(t => t.key === someTodo.key), 'a deleted to-do stays deleted after sync');
+console.log('\nALL V10 PASSED');
