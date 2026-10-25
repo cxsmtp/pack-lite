@@ -2889,13 +2889,15 @@ svg.i { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-widt
 .search-pill:hover { border-color: var(--line-2); color: var(--muted); }
 .search-pill span { flex: 1; text-align: left; }
 .kbd { font: 500 .7rem/1 var(--mono); color: var(--muted); border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 5px; padding: 3px 5px; background: var(--surface); }
-.ib { position: relative; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 10px; border: 0; background: none; color: var(--fg-2); }
+.ib { position: relative; flex: none; overflow: hidden; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 10px; border: 0; background: none; color: var(--fg-2); }
 .ib:hover { background: var(--hover); color: var(--fg); }
 .ib .dot { position: absolute; top: 8px; right: 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 2px var(--bg); }
 .ib .dot.on { background: var(--ok); }
 .ib .dot.err { background: var(--danger); }
 .ib .badge { position: absolute; top: 3px; right: 1px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--danger); color: #fff; font: 600 .66rem/18px var(--font); text-align: center; box-shadow: 0 0 0 2px var(--bg); }
-.ib.spin svg { animation: rot .9s linear infinite; }
+.ib .rot { display: grid; place-items: center; width: 20px; height: 20px; transform-origin: 50% 50%; }
+.ib.syncing .rot { animation: rot .9s linear infinite; }
+.ib.syncing .dot { background: var(--accent); }
 .only-phone { display: none !important; }
 
 /* ---------- page ---------- */
@@ -3227,7 +3229,7 @@ mark { background: none; color: var(--accent); font-weight: 600; }
       <button class="search-pill" type="button" data-act="palette" aria-label="Search everything"><svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><span>Search</span><span class="kbd" id="kbdhint">⌘K</span></button>
       <button class="ib only-phone" type="button" data-act="palette" aria-label="Search everything"><svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
       <button class="ib only-phone" type="button" data-view="review" aria-label="Review"><svg class="i" viewBox="0 0 24 24"><path d="M12 20.5s-7.5-4.6-9.3-9.2C1.5 8.1 3.6 4.5 7.1 4.5c2 0 3.6 1.1 4.9 2.8 1.3-1.7 2.9-2.8 4.9-2.8 3.5 0 5.6 3.6 4.4 6.8-1.8 4.6-9.3 9.2-9.3 9.2z"/></svg><span class="badge" id="mbadge" hidden></span></button>
-      <button class="ib" type="button" id="syncbtn" aria-label="Sync now" title="Sync now"><svg class="i" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2"/><path d="M21 4v5h-5M3 20v-5h5"/></svg><span class="dot" id="sdot"></span></button>
+      <button class="ib" type="button" id="syncbtn" aria-label="Sync now" title="Sync now"><span class="rot"><svg class="i" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2"/><path d="M21 4v5h-5M3 20v-5h5"/></svg></span><span class="dot" id="sdot"></span></button>
       <button class="ib only-desk" type="button" data-act="lock" id="lockbtn" aria-label="Lock now" title="Lock now" hidden><svg class="i" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="3"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></button>
       <button class="ib only-desk" type="button" data-act="theme" id="themebtn" aria-label="Change theme" title="Theme"></button>
       <button class="ib only-desk" type="button" data-act="fullscreen" id="fsbtn" aria-label="Full screen" title="Full screen" hidden><svg class="i" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
@@ -3468,12 +3470,14 @@ mark { background: none; color: var(--accent); font-weight: 600; }
   function refreshState() { return call('state').then(function (st) { S.state = st; if (st.cfg && st.cfg.theme && !store('lifeos.theme')) applyTheme(st.cfg.theme); renderShell(); return st; }); }
   function doSync() {
     if (!S.state || !S.state.configured) { toast('Add your Pocket API key first.'); go('settings', 'pocket'); return; }
-    var b = $('#syncbtn'); b.classList.add('spin'); b.disabled = true;
+    var b = $('#syncbtn');
+    if (b.disabled) return;
+    b.classList.add('syncing'); b.disabled = true; toast('Syncing with Pocket…', 60000);
     call('sync').then(function (r) {
-      b.classList.remove('spin'); b.disabled = false;
+      b.classList.remove('syncing'); b.disabled = false;
       toast(r.message || 'Sync finished', 5000);
       return refreshState().then(function () { if (S.view !== 'settings') go(S.view, S.sub); });
-    }).catch(function (e) { b.classList.remove('spin'); b.disabled = false; renderSync(); fail(e); });
+    }).catch(function (e) { b.classList.remove('syncing'); b.disabled = false; renderSync(); fail(e); });
   }
 
   /* ---------- rows ---------- */
